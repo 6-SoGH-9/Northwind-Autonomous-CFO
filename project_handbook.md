@@ -2,8 +2,8 @@
 
 **Status:** Living document. Contains only stable, approved information — not work in progress.
 **Maintained by:** Architect/PM (Claude), updated after each reviewed Builder Return Report.
-**Handbook version:** 1.5
-**Last updated:** Cycle 3, Task 2 briefed (Validation Independence Principle adopted; Task 2 itself not yet complete).
+**Handbook version:** 1.6
+**Last updated:** Cycle 3, Task 2 — implementation and execution evidence reviewed; filename and dataset-architecture questions resolved; final dataset provenance confirmation pending before close-out.
 
 ---
 
@@ -13,12 +13,12 @@
 |---|---|
 | Product target version | v1.0 (Information Architecture frozen per Section 3) |
 | Environment | **Live** |
-| Current cycle | Cycle 3 — Task 1 complete |
-| Current task | None open — Cycle 3, Task 2 not yet briefed |
-| Current Builder Brief | None active (`builder_brief_cycle3_task1.md` closed out) |
-| Current status | Cycle 2 (Tasks 1–4) and Cycle 3 (Task 1) **complete, passed, promoted to Live.** Canonical object of the Live system is now the Approved Financial Close (D10), with a minimal Close History resolution/archival layer verified end-to-end (bootstrap path + normal path, both independently exercised). HTML story/deck still carved out, still blocked on file delivery. |
+| Current cycle | Cycle 3 — Task 2 in progress (implementation reviewed, one open item remaining) |
+| Current task | Cycle 3, Task 2 — `close_validation.py` production engine. Implementation and execution evidence independently reviewed and accepted. Filename question resolved (see below). **Remaining before close-out: canonical dataset file must be supplied and re-verified against it.** |
+| Current Builder Brief | `builder_brief_cycle3_task2.md` — still open pending final dataset confirmation |
+| Current status | Cycle 2 (Tasks 1–4) and Cycle 3 (Task 1) **complete, passed, promoted to Live.** Cycle 3, Task 2: `close_validation.py` built and reviewed — clean interface (zero I/O, zero fiscal-calendar logic, zero injected literals, independently re-verified by grep), dashboard correctly swapped to consume it, fixture correctly reclassified as regression-only. Two resolved-by-evidence items: (1) canonical dashboard filename is `Northwind_Financial_Dashboard.py` (underscore) — confirmed via the file's own on-disk name overriding a stale internal docstring claim, not decided from memory; (2) dataset architecture is repo-root placement, no `data/` subdirectory, matching the implementation's actual glob-based resolution exactly as built (Option B — see Section 12). **One item open:** the dataset used in Task 2's verification runs was not confirmed as the canonical file at time of testing; Architect to supply the confirmed file, Builder to re-run tie-outs/fixture/AppTest against it before Task 2 is marked Verified. |
 | Last approved milestone | Cycle 3, Task 1 — Close History bootstrap + normal-path resolution, verified against actual files |
-| Next milestone | Write-up document (highest-priority open gap, zero remaining technical blocker); HTML story/deck once current files are supplied |
+| Next milestone | Cycle 3, Task 2 close-out (pending dataset confirmation); write-up document (highest-priority open gap, zero remaining technical blocker once Task 2 closes) |
 
 *A new Builder session should be able to read this table alone and know exactly where the project stands before opening anything else.*
 
@@ -188,7 +188,7 @@ Reused unchanged from `autonomous_cfo_office_master_brief.md`. Ten phases (0-9),
 
 **Cycle 3, Task 1 close-out:** D10 implementation status moved to Verified. Live's canonical data model is now the Approved Financial Close, with a minimal, storage-neutral resolution/archival layer in place. Full retention, querying across many closes, and lifecycle management remain deferred to Phase 9, per the task's explicit scope.
 
-**Status: promoted to Live.** Batch = `rollups.py`, `Northwind Financial_Dashboard.py`, `northwind_narrative_prompt.md`, `assumptions_and_limitations.md`, `requirements.txt`, `close_history.py`. **Excluded from Live** (Build/Test verification tools only): `close_v1_v2_simulation.py`, `close_orchestrator.py`. HTML story and PPTX deck remain blocked on file delivery, carved out of this promotion.
+**Status: promoted to Live.** Batch = `rollups.py`, `Northwind_Financial_Dashboard.py`, `northwind_narrative_prompt.md`, `assumptions_and_limitations.md`, `requirements.txt`, `close_history.py`. **Excluded from Live** (Build/Test verification tools only): `close_v1_v2_simulation.py`, `close_orchestrator.py`. HTML story and PPTX deck remain blocked on file delivery, carved out of this promotion.
 
 ## 10. Known Technical Debt
 
@@ -217,7 +217,7 @@ What should sit in the active Build Project vs. external archive, and why. Re-ev
 | Current Builder Brief | Required every session | Defines the active task and acceptance criteria; moves to archive the moment it's superseded |
 | `rollups.py` | Required every session | The single pipeline; nearly every task touches or depends on it, and its own tie-out checks are the primary verification mechanism |
 | `assumptions_and_limitations.md` | Required every session | Small; must be checked/updated whenever a decision or limitation is touched, so its absence risks silent contradiction |
-| `Northwind Financial_Dashboard.py` | Required only for dashboard/UI-related tasks | Large file; needed when a task touches layout, tabs, or charts, not for pure pipeline or write-up work |
+| `Northwind_Financial_Dashboard.py` | Required only for dashboard/UI-related tasks | Large file; needed when a task touches layout, tabs, or charts, not for pure pipeline or write-up work |
 | `northwind_narrative_prompt.md` | Required only for narrative/prompt-related tasks | Needed when a task touches narrative generation or prompt wording, not for pipeline-only or dashboard-layout-only work |
 | `requirements.txt` | Required every session | Pins pandas/numpy/openpyxl/streamlit to the versions confirmed clean (Cycle 2 Task 4); a fresh unpinned install reproduces the pandas 3.0 `Styler.applymap` crash |
 | `close_history.py` | Required every session | Storage-neutral Close History resolve/archive logic (D10); imported by `rollups.py`'s dataset resolution path |
@@ -225,6 +225,10 @@ What should sit in the active Build Project vs. external archive, and why. Re-ev
 | `close_v1_v2_simulation.py` | Build/Test only — never Live | Verification tool for Phase 2/3 logic; imported by `close_orchestrator.py`. Not part of the Live batch — Live's Close History starts from real data, not simulation output. **Frozen as of Cycle 3, Task 2** — regression-only fixture, not evidence of generic correctness (see Validation Independence Principle). Not extended or modified by Build going forward. |
 | `close_orchestrator.py` | Build/Test only — never Live | Same category as `close_v1_v2_simulation.py`: verifies Close History bootstrap + normal-path resolution logic. Unconditionally deletes any pre-existing `close_history/` on every run, by design, to prove the bootstrap path for real — must never run against a populated production Close History. |
 | Archived Builder Briefs | Archive only | Traceability; content already distilled into the Decision Log and Section 8 |
+
+**Dataset location (decided Cycle 3, Task 2 — Option B, confirmed by direct implementation inspection):** the bootstrap dataset lives at **repo root**, alongside the application files — not in a `data/` subdirectory. This matches the implementation exactly as built: `rollups.py` and `close_v1_v2_simulation.py` both resolve it via `glob.glob("*.xlsx")` in the current working directory, filtering for filenames containing `northwind`, `sample`, and `dataset` (case-insensitive) while excluding `output` — not an exact filename match. Exactly one match must exist, or the code raises an error rather than guessing. `NORTHWIND_RAW_DATASET_PATH` is the built-in override for any deployment that needs a different location. A `data/` subdirectory was considered and explicitly rejected for now — it would require a code change that doesn't exist yet; adopting it as documented "architecture" ahead of the implementation would recreate the exact Handbook/code mismatch this project has repeatedly had to resolve. Revisit only alongside an actual code change, not as a documentation update in isolation.
+
+**Filename resolution precedent (Cycle 3, Task 2):** `Northwind_Financial_Dashboard.py` (underscore) was confirmed canonical by direct inspection of the actual file on disk, which contradicted its own internal docstring (which incorrectly claimed a space-variant run command) and contradicted this Handbook's prior text. The real artifact overrode both the code's own stale comment and the Handbook — evidence from the artifact itself outranks any other source, including this document, when they disagree. This Handbook has been corrected to match; if this file is ever renamed in the future, update here deliberately, not by inference.
 | Archived Builder Return Reports | Archive only | Traceability; content already distilled into the Review & Acceptance History |
 | `rollups_output.xlsx` | Regenerate while in progress; kept once archived | While a close is in progress: fully reproduced by running `rollups.py`, no architectural knowledge, don't keep. Once a close is approved: copied into that close's Close History snapshot as part of the permanent audit trail (D10) — same file, different rule depending on state. |
 
