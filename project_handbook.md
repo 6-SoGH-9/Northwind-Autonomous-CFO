@@ -263,3 +263,4 @@ What should sit in the active Build Project vs. external archive, and why. Re-ev
 ---
 
 *Handbook conventions: this file is edited in place, not appended to. Superseded content is removed, not struck through. The Decision Log and Review & Acceptance History are the only sections that grow purely by addition; everything else reflects only the current state.*
+SYNC TEST — 2026-08-08 — refresh verification
