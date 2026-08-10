@@ -211,8 +211,49 @@ def build_expense_rollup(dim_cols, period_col, period_order):
 
 exp_by_dept_q = build_expense_rollup(["Department"], "Fiscal Quarter", quarter_order)
 exp_by_dept_y = build_expense_rollup(["Department"], "Fiscal Year", year_order)
-exp_by_dept_cat_q = expenses.groupby(["Department", "Category", "Fiscal Quarter"], as_index=False)["Amount ($)"].sum()
-exp_by_dept_cat_y = expenses.groupby(["Department", "Category", "Fiscal Year"], as_index=False)["Amount ($)"].sum()
+# ---------------------------------------------------------------------------
+# COST STRUCTURE INVESTIGATION VIEW BRIEF (2026-08-09) — dependency identified
+# during implementation, flagged per Brief scope rules:
+#
+# The Department x Category (Cost Type) grain was ALREADY computed here
+# (exp_by_dept_cat_q / exp_by_dept_cat_y, as plain grouped sums) before this
+# Brief. What was missing was Current/Prior/Variance $/Variance % on that
+# same grain. Rather than adding a new rollup function, these two lines now
+# call the SAME generic build_expense_rollup() already used one line above
+# for the Department-only cut, just with dim_cols=["Department", "Category"]
+# instead of ["Department"]. This:
+#   - invents no new period logic (Acceptance Criterion 3) — it is the
+#     identical add_variance() call, same period_order, same prior_shift=1,
+#     already used and tie-out-verified for every other expense cut in this
+#     file;
+#   - is additive to the existing exp_by_dept_cat_q/_y tables (adds Prior
+#     Period ($), QoQ/YoY Variance ($), QoQ/YoY Variance (%) columns; the
+#     existing Amount ($) column and its values are unchanged) — nothing
+#     that previously read these two variables loses a column or a value;
+#   - was confirmed via inspection that no other file in this Brief's
+#     required set reads exp_by_dept_cat_q/_y before this change, so there
+#     is no downstream consumer whose existing behavior this could alter.
+# This is flagged here per the Brief's explicit instruction to call out any
+# such dependency rather than silently absorbing it — Architect to confirm
+# this reading is acceptable (reuse, not a new rollup) at review.
+# ---------------------------------------------------------------------------
+exp_by_dept_cat_q = build_expense_rollup(["Department", "Category"], "Fiscal Quarter", quarter_order)
+exp_by_dept_cat_y = build_expense_rollup(["Department", "Category"], "Fiscal Year", year_order)
+
+# ---------------------------------------------------------------------------
+# COST STRUCTURE VIEWS BRIEF v2 (2026-08-09, final) — Criterion 18: confirmed
+# via direct inspection of this file and Northwind_Financial_Dashboard.py
+# (grep for "exp_by_cat_q" / "exp_by_cat_y" prior to this edit returned zero
+# matches) that no existing consumer reads these variable names — they are
+# newly introduced here, not a rename or redefinition of anything that
+# previously existed. Reuses the SAME generic build_expense_rollup() a third
+# time, now with dim_cols=["Category"] (no Department dimension at all) —
+# same add_variance() call, same period_order, same prior_shift=1 already
+# tie-out-verified for the Department-only and Department x Category cuts.
+# No new rollup function, no new period logic.
+# ---------------------------------------------------------------------------
+exp_by_cat_q = build_expense_rollup(["Category"], "Fiscal Quarter", quarter_order)
+exp_by_cat_y = build_expense_rollup(["Category"], "Fiscal Year", year_order)
 
 exp_by_dept_q = add_yoy_on_quarters(exp_by_dept_q, "Department")
 
@@ -743,6 +784,93 @@ else:
     print("All checks passed, including Step 2 segment margin tie-outs and Step 3 decomposition tie-outs.")
 
 # ---------------------------------------------------------------------------
+# 11l. NEW (Cost Structure Investigation View Brief, 2026-08-09): Department x
+# Category (Cost Type) breakdown must sum to the SAME Department-level total
+# already tied out above (11 / 8c) — this is Acceptance Criteria 1 and 2 of
+# that Brief (department reconciliation + internal category-sum consistency
+# are the same identity, checked once here). Uses exp_by_dept_cat_q, which
+# as of this Brief is built by the identical build_expense_rollup() function
+# as exp_by_dept_q, just at Department x Category grain instead of
+# Department-only grain.
+# ---------------------------------------------------------------------------
+dept_cat_sum_q = exp_by_dept_cat_q.groupby(["Department", "Fiscal Quarter"])["Amount ($)"].sum()
+dept_only_q = exp_by_dept_q.set_index(["Department", "Fiscal Quarter"])["Amount ($)"]
+diff10 = (dept_cat_sum_q - dept_only_q).abs()
+if diff10.max() > 0.01:
+    errors.append(f"Department x Category (Cost Type Investigation View) sum vs Department-level total mismatch: max diff {diff10.max():.2f}")
+else:
+    print(f"OK  Department x Category (Cost Type Investigation View) sums to existing Department-level Expense total, every quarter (max diff ${diff10.max():.4f})")
+
+dept_cat_sum_y = exp_by_dept_cat_y.groupby(["Department", "Fiscal Year"])["Amount ($)"].sum()
+dept_only_y = exp_by_dept_y.set_index(["Department", "Fiscal Year"])["Amount ($)"]
+diff11 = (dept_cat_sum_y - dept_only_y).abs()
+if diff11.max() > 0.01:
+    errors.append(f"Department x Category (Cost Type Investigation View, annual) sum vs Department-level total mismatch: max diff {diff11.max():.2f}")
+else:
+    print(f"OK  Department x Category (Cost Type Investigation View) sums to existing Department-level Expense total, every fiscal year (max diff ${diff11.max():.4f})")
+
+print()
+if errors:
+    print("ALL FAILURES (post-Investigation-View check):")
+    for e in errors:
+        print(" -", e)
+else:
+    print("All checks passed, including Step 2 segment margin tie-outs, Step 3 decomposition tie-outs, and the new Cost Structure Investigation View tie-out.")
+
+# ---------------------------------------------------------------------------
+# 11m. NEW (Cost Structure Views Brief v2, 2026-08-09): Cost Category-only
+# (company-wide, no Department) view tie-outs.
+#
+# Criterion 12: exp_by_cat_q's per-Category, per-period Amount ($) must equal
+# that same Category's Amount ($) summed across all Departments in
+# exp_by_dept_cat_q (internal consistency between the two new views).
+#
+# Criterion 13: exp_by_cat_q's grand total (summed across all Categories),
+# per period, must equal exp_by_dept_q's total for that period -- i.e. the
+# SAME Department-level expense total already tied out under Criterion 1 /
+# check 8c above (which itself already ties to PL_Summary Total Opex).
+# ---------------------------------------------------------------------------
+cat_from_dept_cat_q = exp_by_dept_cat_q.groupby(["Category", "Fiscal Quarter"])["Amount ($)"].sum()
+cat_only_q = exp_by_cat_q.set_index(["Category", "Fiscal Quarter"])["Amount ($)"]
+diff12 = (cat_from_dept_cat_q - cat_only_q).abs()
+if diff12.max() > 0.01:
+    errors.append(f"Cost Category-only view vs Dept x Category summed-to-Category mismatch (Criterion 12, quarterly): max diff {diff12.max():.2f}")
+else:
+    print(f"OK  Cost Category-only view (Criterion 12) reconciles to Dept x Category view summed across departments, every quarter (max diff ${diff12.max():.4f})")
+
+cat_from_dept_cat_y = exp_by_dept_cat_y.groupby(["Category", "Fiscal Year"])["Amount ($)"].sum()
+cat_only_y = exp_by_cat_y.set_index(["Category", "Fiscal Year"])["Amount ($)"]
+diff13a = (cat_from_dept_cat_y - cat_only_y).abs()
+if diff13a.max() > 0.01:
+    errors.append(f"Cost Category-only view vs Dept x Category summed-to-Category mismatch (Criterion 12, annual): max diff {diff13a.max():.2f}")
+else:
+    print(f"OK  Cost Category-only view (Criterion 12) reconciles to Dept x Category view summed across departments, every fiscal year (max diff ${diff13a.max():.4f})")
+
+cat_grand_total_q = exp_by_cat_q.groupby("Fiscal Quarter")["Amount ($)"].sum()
+dept_grand_total_q = exp_by_dept_q.groupby("Fiscal Quarter")["Amount ($)"].sum()
+diff13 = (cat_grand_total_q - dept_grand_total_q).abs()
+if diff13.max() > 0.01:
+    errors.append(f"Cost Category-only grand total vs Department-level total mismatch (Criterion 13, quarterly): max diff {diff13.max():.2f}")
+else:
+    print(f"OK  Cost Category-only grand total (Criterion 13) reconciles to existing Department-level Expense total, every quarter (max diff ${diff13.max():.4f})")
+
+cat_grand_total_y = exp_by_cat_y.groupby("Fiscal Year")["Amount ($)"].sum()
+dept_grand_total_y = exp_by_dept_y.groupby("Fiscal Year")["Amount ($)"].sum()
+diff13b = (cat_grand_total_y - dept_grand_total_y).abs()
+if diff13b.max() > 0.01:
+    errors.append(f"Cost Category-only grand total vs Department-level total mismatch (Criterion 13, annual): max diff {diff13b.max():.2f}")
+else:
+    print(f"OK  Cost Category-only grand total (Criterion 13) reconciles to existing Department-level Expense total, every fiscal year (max diff ${diff13b.max():.4f})")
+
+print()
+if errors:
+    print("ALL FAILURES (post-Cost-Category-only check):")
+    for e in errors:
+        print(" -", e)
+else:
+    print("All checks passed, including the Department x Cost Category tie-out and the new Cost Category-only tie-outs (Criteria 12/13).")
+
+# ---------------------------------------------------------------------------
 # 9. Save rollups for the next step (segment investment views + AI narrative)
 # ---------------------------------------------------------------------------
 with pd.ExcelWriter("rollups_output.xlsx", engine="openpyxl") as writer:
@@ -756,6 +884,8 @@ with pd.ExcelWriter("rollups_output.xlsx", engine="openpyxl") as writer:
     exp_by_dept_y.to_excel(writer, sheet_name="Exp_by_Dept_Y", index=False)
     exp_by_dept_cat_q.to_excel(writer, sheet_name="Exp_by_Dept_Cat_Q", index=False)
     exp_by_dept_cat_y.to_excel(writer, sheet_name="Exp_by_Dept_Cat_Y", index=False)
+    exp_by_cat_q.to_excel(writer, sheet_name="Exp_by_Cat_Q", index=False)
+    exp_by_cat_y.to_excel(writer, sheet_name="Exp_by_Cat_Y", index=False)
     hc_by_dept_q.to_excel(writer, sheet_name="Headcount_Q", index=False)
     hc_by_dept_y.to_excel(writer, sheet_name="Headcount_Y", index=False)
     bva_q.to_excel(writer, sheet_name="BvA_Q", index=False)
@@ -786,6 +916,10 @@ print("\nSample — Salaries & Benefits Volume/Rate Bridge (Q2 FY2024, first qua
 print(sb_volrate_q[sb_volrate_q["Fiscal Quarter"] == "Q2 FY2024"].to_string(index=False))
 print("\nSample — Breadth/Concentration, Revenue by Region (all quarters):")
 print(breadth_rev_region_q[["Fiscal Quarter", "Total Variance ($)", "Top Contributor", "Top Contributor Share", "Breadth/Concentration Flag"]].to_string(index=False))
+print("\nSample — Department x Cost Type Investigation View, Q2 FY2024 (first quarter with a prior period):")
+print(exp_by_dept_cat_q[exp_by_dept_cat_q["Fiscal Quarter"] == "Q2 FY2024"].to_string(index=False))
+print("\nSample — Cost Category-only (company-wide) view, Q2 FY2024 (first quarter with a prior period):")
+print(exp_by_cat_q[exp_by_cat_q["Fiscal Quarter"] == "Q2 FY2024"].to_string(index=False))
 
 # ---------------------------------------------------------------------------
 # 12. STEP 4a — Budget vs Actual flags + recurrence tracking
