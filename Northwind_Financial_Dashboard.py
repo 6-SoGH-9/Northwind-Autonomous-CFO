@@ -180,6 +180,13 @@ if cadence == "Quarterly":
     exp_dept_df, sb_df, breadth_df = R.exp_by_dept_q, R.sb_volrate_q, R.breadth_all_q
     hc_dept_df, company_rev_df, bva_df = R.hc_dept_q, R.company_rev_per_hc_q, R.bva_q
     opex_per_emp_df = R.opex_per_employee_q
+    # Cost Structure Investigation View Brief (2026-08-09): Department x
+    # Cost Type (Category) grain, current/prior/variance now carried on
+    # exp_by_dept_cat_q/_y (see rollups.py Section 4 for the extension).
+    exp_dept_cat_df = R.exp_by_dept_cat_q
+    # Cost Structure Views Brief v2 (2026-08-09, final): Cost Category-only,
+    # company-wide grain (no Department dimension) — see rollups.py.
+    exp_cat_df = R.exp_by_cat_q
 else:
     period_col = "Fiscal Year"
     period_order = R.year_order
@@ -189,6 +196,8 @@ else:
     exp_dept_df, sb_df, breadth_df = R.exp_by_dept_y, R.sb_volrate_y, R.breadth_all_y
     hc_dept_df, company_rev_df, bva_df = R.hc_dept_y, R.company_rev_per_hc_y, R.bva_y
     opex_per_emp_df = R.opex_per_employee_y
+    exp_dept_cat_df = R.exp_by_dept_cat_y
+    exp_cat_df = R.exp_by_cat_y
 
 # periods with a prior period available (skip the very first, nothing to compare)
 selectable_periods = [p for p in period_order if period_order.index(p) > 0]
@@ -311,6 +320,62 @@ with tab_exp:
     exp_chart = R.expenses.groupby(["Department", period_col], as_index=False)["Amount ($)"].sum()
     pivot3 = exp_chart.pivot(index=period_col, columns="Department", values="Amount ($)").reindex(period_order)
     st.bar_chart(pivot3)
+
+    # -------------------------------------------------------------------
+    # Cost Structure Investigation View — Builder Brief, 2026-08-09.
+    # Department x Cost Type (Category), Current vs Prior, Variance $,
+    # Variance %. Added so a flagged cost variance (e.g. a Close
+    # Validation Status Phase 2/3 flag) can be investigated using
+    # information the Controller can actually see on this page, at the
+    # same Department/Category grain close_validation.py reads from.
+    # ADDITIVE ONLY — existing sections below (S&B bridge, breadth/
+    # concentration, Opex/Employee) are unchanged and unmoved.
+    # -------------------------------------------------------------------
+    st.subheader(f"Department × Cost Type — Investigation View ({current_period} vs {prior_period})")
+    st.caption(
+        "Department and Cost Type (Category) breakdown, current vs prior period — same "
+        "Department/Category grain, current/prior period definitions, and Amount ($) values "
+        "close_validation.py's Phase 2/3 checks read from, so a flagged item on the Close "
+        "Validation Status page can be traced here without needing internal validation-engine "
+        "output."
+    )
+    dept_cat_current = exp_dept_cat_df[exp_dept_cat_df[period_col] == current_period][
+        ["Department", "Category", "Amount ($)", "Prior Period ($)", "QoQ/YoY Variance ($)", "QoQ/YoY Variance (%)"]
+    ].rename(columns={"Amount ($)": "Current Period ($)"})
+    dept_cat_current = dept_cat_current.sort_values(["Department", "Category"]).reset_index(drop=True)
+    dept_cat_var_cols = ["QoQ/YoY Variance ($)", "QoQ/YoY Variance (%)"]
+    st.dataframe(
+        style_variance_df(dept_cat_current, higher_is_bad_cols=dept_cat_var_cols),
+        use_container_width=True,
+    )
+
+    # -------------------------------------------------------------------
+    # Cost Category-only (company-wide) view — Builder Brief v2, 2026-08-09.
+    # No Department dimension. Positioned alongside the Department x Cost
+    # Category view per the Brief, so a Controller can see whether a cost
+    # category is moving broadly across the business or is concentrated
+    # within a single department (that latter question is answered by the
+    # view above; this view answers "is it broad or department-specific").
+    # ADDITIVE ONLY — does not touch the Department x Cost Category view
+    # above or any section below.
+    # -------------------------------------------------------------------
+    st.subheader(f"Cost Category — Company-Wide View ({current_period} vs {prior_period})")
+    st.caption(
+        "Cost Category totals, company-wide (summed across all departments), current vs prior "
+        "period. Reconciles exactly to the Department × Cost Category view above, summed across "
+        "departments, and its grand total reconciles to the Department-level Expense total on "
+        "this page. Dashboard-only presentation — not used by Phase 2/3 validation or plausibility "
+        "logic, which continue to operate at the Department × Category grain only."
+    )
+    cat_current = exp_cat_df[exp_cat_df[period_col] == current_period][
+        ["Category", "Amount ($)", "Prior Period ($)", "QoQ/YoY Variance ($)", "QoQ/YoY Variance (%)"]
+    ].rename(columns={"Amount ($)": "Current Period ($)"})
+    cat_current = cat_current.sort_values(["Category"]).reset_index(drop=True)
+    cat_var_cols = ["QoQ/YoY Variance ($)", "QoQ/YoY Variance (%)"]
+    st.dataframe(
+        style_variance_df(cat_current, higher_is_bad_cols=cat_var_cols),
+        use_container_width=True,
+    )
 
     st.subheader(f"Salaries & Benefits Volume/Rate Bridge — {current_period}")
     sb_cost_cols = ["Headcount Change", "Cost-per-Head Change ($)", "Volume Effect ($)",
