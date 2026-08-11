@@ -112,6 +112,45 @@ def add_fiscal_cols(df, date_col="Date"):
     return df
 
 
+# -----------------------------------------------------------------------------
+# DASHBOARD BUG FIX (Architect-confirmed, display-only): the internal 'Fiscal
+# Quarter' representation built above ('Q1 FY2024') is UNCHANGED by this fix --
+# it remains the value used everywhere for grouping, filtering, sorting,
+# merging, and as the Close History / Phase 2/3 period label. Nothing that
+# reads df["Fiscal Quarter"] as a key anywhere in this file, close_history.py,
+# or close_validation.py is touched.
+#
+# fmt_period_label() is a NEW, additive, pure display-formatting function:
+# 'Q1 FY2024' -> 'Q1 2024' for user-facing rendering only. It is intentionally
+# narrow -- it only recognizes the exact 'Q# FY####' shape and returns
+# anything else (e.g. 'FY2024' annual labels, which are explicitly out of
+# scope for this bug per the Architect's report) completely unchanged. Used
+# by build_user_prompt() below (the only place in this file that embeds a
+# period label directly into user-visible text) and imported by
+# Northwind_Financial_Dashboard.py (as R.fmt_period_label) for its own
+# chart/table/caption/selector rendering, so both files share one
+# single-source-of-truth formatter rather than two independently maintained
+# regexes that could drift apart.
+# -----------------------------------------------------------------------------
+import re as _re
+
+_QUARTER_LABEL_RE = _re.compile(r"^(Q[1-4]) FY(\d{4})$")
+
+
+def fmt_period_label(period):
+    """Display-only: 'Q4 FY2026' -> 'Q4 2026'. Anything not matching the
+    exact 'Q# FY####' shape (e.g. 'FY2026', None, already-formatted labels)
+    is returned unchanged. Never used as a lookup/merge/sort key -- callers
+    must always filter/join on the original 'Fiscal Quarter' value and only
+    apply this at the point of rendering to a user."""
+    if not isinstance(period, str):
+        return period
+    m = _QUARTER_LABEL_RE.match(period)
+    if not m:
+        return period
+    return f"{m.group(1)} {m.group(2)}"
+
+
 revenue = add_fiscal_cols(revenue)
 expenses = add_fiscal_cols(expenses)
 headcount = add_fiscal_cols(headcount)
@@ -1176,8 +1215,8 @@ def build_user_prompt(period_col, period_order, current_period, prior_period, co
     if not bva_lines:
         bva_lines = ["  (none flagged Watch or Major Miss this period)"]
 
-    prompt = f"""Period: {current_period}
-Comparison basis: vs. {comparison_label}
+    prompt = f"""Period: {fmt_period_label(current_period)}
+Comparison basis: vs. {fmt_period_label(comparison_label)}
 
 DATA:
 
@@ -1187,13 +1226,13 @@ Consolidated P&L:
 - Operating Profit: {fmt_money(op_profit_current)} vs {fmt_money(op_profit_prior)}
 - Operating Margin: {margin_current:.1%} vs {(f"{margin_prior:.1%}" if pd.notna(margin_prior) else "N/A")}
 
-Revenue by Region ({current_period}):
+Revenue by Region ({fmt_period_label(current_period)}):
 {chr(10).join(region_lines)}
 
-Revenue by Product Line ({current_period}):
+Revenue by Product Line ({fmt_period_label(current_period)}):
 {chr(10).join(product_lines)}
 
-Regional Go-to-Market Investment / Product Line R&D Investment ({current_period}) — $ only, no cross-segment % (see note below):
+Regional Go-to-Market Investment / Product Line R&D Investment ({fmt_period_label(current_period)}) — $ only, no cross-segment % (see note below):
 Region cut (net of Sales & Marketing + Customer Success only):
 {chr(10).join(region_cm_lines)}
 Product Line cut (net of R&D only):
