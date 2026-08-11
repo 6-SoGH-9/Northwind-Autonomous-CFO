@@ -201,9 +201,29 @@ else:
 
 # periods with a prior period available (skip the very first, nothing to compare)
 selectable_periods = [p for p in period_order if period_order.index(p) > 0]
-current_period = st.sidebar.selectbox("Current period", selectable_periods, index=len(selectable_periods) - 1)
+current_period = st.sidebar.selectbox(
+    "Current period", selectable_periods, index=len(selectable_periods) - 1,
+    format_func=R.fmt_period_label,
+)
 prior_period = period_order[period_order.index(current_period) - 1]
-st.sidebar.markdown(f"**Comparison basis:** vs. {prior_period}")
+st.sidebar.markdown(f"**Comparison basis:** vs. {R.fmt_period_label(prior_period)}")
+
+# st.line_chart() renders its x-axis as a nominal (string) category and sorts
+# it alphabetically, ignoring the DataFrame's row order. That's harmless for
+# "Q# FY####" labels (alphabetical == chronological there), but once the
+# label is reformatted to "Q# YYYY" for display, alphabetical order breaks
+# the year grouping (Q1 2024, Q1 2025, Q1 2026, Q2 2024, ...). Setting the
+# index to an ordered Categorical over the true chronological label sequence
+# makes the axis ordinal instead of nominal, so it's plotted in that order.
+_chrono_labels = [R.fmt_period_label(p) for p in period_order]
+
+
+def _chrono_index(obj):
+    """Reassign obj's index to an ordered Categorical matching period_order's
+    chronological sequence, so full-trend st.line_chart() calls plot left-to-
+    right in true chronological order instead of alphabetical order."""
+    obj.index = pd.Categorical(obj.index, categories=_chrono_labels, ordered=True)
+    return obj
 
 if cadence == "Annual":
     ann_flags = R.bva_y[(R.bva_y[period_col] == current_period) & (R.bva_y["Flag"] != "On Track")]
@@ -288,15 +308,19 @@ with tab_rev:
         chart_df = R.revenue.groupby(["Region", period_col if cadence == "Quarterly" else "Fiscal Year"], as_index=False)["Revenue ($)"].sum()
         pivot = chart_df.pivot(index=period_col if cadence == "Quarterly" else "Fiscal Year", columns="Region", values="Revenue ($)")
         pivot = pivot.reindex(period_order)
-        st.line_chart(pivot)
+        if cadence == "Quarterly":
+            pivot = pivot.rename(index=R.fmt_period_label)
+        st.line_chart(_chrono_index(pivot))
     with col2:
         st.subheader("Revenue by Product Line — full trend")
         chart_df2 = R.revenue.groupby(["Product Line", period_col if cadence == "Quarterly" else "Fiscal Year"], as_index=False)["Revenue ($)"].sum()
         pivot2 = chart_df2.pivot(index=period_col if cadence == "Quarterly" else "Fiscal Year", columns="Product Line", values="Revenue ($)")
         pivot2 = pivot2.reindex(period_order)
-        st.line_chart(pivot2)
+        if cadence == "Quarterly":
+            pivot2 = pivot2.rename(index=R.fmt_period_label)
+        st.line_chart(_chrono_index(pivot2))
 
-    st.subheader(f"Revenue Mix (%) — {current_period}")
+    st.subheader(f"Revenue Mix (%) — {R.fmt_period_label(current_period)}")
     st.caption(
         "Share of total revenue this period — a direct ratio of actual revenue, not a proportionally "
         "allocated cost, so (unlike the Region/Product Investment pages' cost ratios) this % genuinely "
@@ -308,18 +332,25 @@ with tab_rev:
     with mixcol2:
         st.bar_chart(rev_product_df[rev_product_df[period_col] == current_period].set_index("Product Line")["Revenue Mix (%)"])
 
-    st.subheader(f"Revenue detail — {current_period} vs {prior_period}")
+    st.subheader(f"Revenue detail — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
     rev_var_cols = ["QoQ/YoY Variance ($)", "QoQ/YoY Variance (%)", "YoY Variance ($)", "YoY Variance (%)"]
-    st.dataframe(style_variance_df(rev_region_df[rev_region_df[period_col] == current_period],
+    rev_region_display = rev_region_df[rev_region_df[period_col] == current_period].copy()
+    rev_product_display = rev_product_df[rev_product_df[period_col] == current_period].copy()
+    if cadence == "Quarterly":
+        rev_region_display[period_col] = rev_region_display[period_col].map(R.fmt_period_label)
+        rev_product_display[period_col] = rev_product_display[period_col].map(R.fmt_period_label)
+    st.dataframe(style_variance_df(rev_region_display,
                                     higher_is_good_cols=rev_var_cols), use_container_width=True)
-    st.dataframe(style_variance_df(rev_product_df[rev_product_df[period_col] == current_period],
+    st.dataframe(style_variance_df(rev_product_display,
                                     higher_is_good_cols=rev_var_cols), use_container_width=True)
 
 with tab_exp:
     st.subheader("Expenses by Department — full trend")
     exp_chart = R.expenses.groupby(["Department", period_col], as_index=False)["Amount ($)"].sum()
     pivot3 = exp_chart.pivot(index=period_col, columns="Department", values="Amount ($)").reindex(period_order)
-    st.bar_chart(pivot3)
+    if cadence == "Quarterly":
+        pivot3 = pivot3.rename(index=R.fmt_period_label)
+    st.bar_chart(_chrono_index(pivot3))
 
     # -------------------------------------------------------------------
     # Cost Structure Investigation View — Builder Brief, 2026-08-09.
@@ -331,7 +362,7 @@ with tab_exp:
     # ADDITIVE ONLY — existing sections below (S&B bridge, breadth/
     # concentration, Opex/Employee) are unchanged and unmoved.
     # -------------------------------------------------------------------
-    st.subheader(f"Department × Cost Type — Investigation View ({current_period} vs {prior_period})")
+    st.subheader(f"Department × Cost Type — Investigation View ({R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)})")
     st.caption(
         "Department and Cost Type (Category) breakdown, current vs prior period — same "
         "Department/Category grain, current/prior period definitions, and Amount ($) values "
@@ -359,7 +390,7 @@ with tab_exp:
     # ADDITIVE ONLY — does not touch the Department x Cost Category view
     # above or any section below.
     # -------------------------------------------------------------------
-    st.subheader(f"Cost Category — Company-Wide View ({current_period} vs {prior_period})")
+    st.subheader(f"Cost Category — Company-Wide View ({R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)})")
     st.caption(
         "Cost Category totals, company-wide (summed across all departments), current vs prior "
         "period. Reconciles exactly to the Department × Cost Category view above, summed across "
@@ -377,18 +408,24 @@ with tab_exp:
         use_container_width=True,
     )
 
-    st.subheader(f"Salaries & Benefits Volume/Rate Bridge — {current_period}")
+    st.subheader(f"Salaries & Benefits Volume/Rate Bridge — {R.fmt_period_label(current_period)}")
     sb_cost_cols = ["Headcount Change", "Cost-per-Head Change ($)", "Volume Effect ($)",
                     "Rate Effect ($)", "Bridge Total ($)", "Actual Variance ($)"]
-    st.dataframe(style_variance_df(sb_df[sb_df[period_col] == current_period],
+    sb_display = sb_df[sb_df[period_col] == current_period].copy()
+    if cadence == "Quarterly":
+        sb_display[period_col] = sb_display[period_col].map(R.fmt_period_label)
+    st.dataframe(style_variance_df(sb_display,
                                     higher_is_bad_cols=sb_cost_cols), use_container_width=True)
     st.caption("Volume effect = change in headcount x prior period cost-per-head. Rate effect = new headcount x change in cost-per-head. Volume + Rate = Actual Variance exactly.")
 
-    st.subheader(f"Breadth / Concentration — {current_period}")
-    st.dataframe(style_breadth_df(breadth_df[breadth_df[period_col] == current_period]), use_container_width=True)
+    st.subheader(f"Breadth / Concentration — {R.fmt_period_label(current_period)}")
+    breadth_display = breadth_df[breadth_df[period_col] == current_period].copy()
+    if cadence == "Quarterly":
+        breadth_display[period_col] = breadth_display[period_col].map(R.fmt_period_label)
+    st.dataframe(style_breadth_df(breadth_display), use_container_width=True)
     st.caption("Threshold: a single segment carrying >=60% of gross variance is flagged Concentrated; otherwise Broad-based.")
 
-    st.subheader(f"Opex per Employee by Department — {current_period}")
+    st.subheader(f"Opex per Employee by Department — {R.fmt_period_label(current_period)}")
     st.caption(
         "A cost-discipline metric — is this department's spend per head rising or falling — not a "
         "workforce-efficiency metric, which is why it lives here rather than on the Headcount & "
@@ -404,10 +441,15 @@ with tab_hc:
     st.subheader("Headcount by Department — full trend (ending headcount)")
     hc_all = R.hc_by_dept_q if cadence == "Quarterly" else R.hc_by_dept_y
     pivot4 = hc_all.pivot(index=period_col, columns="Department", values="Ending Headcount").reindex(period_order)
-    st.line_chart(pivot4)
+    if cadence == "Quarterly":
+        pivot4 = pivot4.rename(index=R.fmt_period_label)
+    st.line_chart(_chrono_index(pivot4))
 
-    st.subheader(f"Headcount by Department — {current_period} vs {prior_period}")
-    st.dataframe(fmt_display_df(hc_dept_df[hc_dept_df[period_col] == current_period]), use_container_width=True)
+    st.subheader(f"Headcount by Department — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
+    hc_dept_display = hc_dept_df[hc_dept_df[period_col] == current_period].copy()
+    if cadence == "Quarterly":
+        hc_dept_display[period_col] = hc_dept_display[period_col].map(R.fmt_period_label)
+    st.dataframe(fmt_display_df(hc_dept_display), use_container_width=True)
 
     st.divider()
     st.subheader("Company-wide Revenue per Headcount")
@@ -434,11 +476,16 @@ with tab_hc:
         with c2:
             st.metric("Company Ending Headcount", f"{row['Company Ending Headcount']:.0f}")
     trend = company_rev_df.set_index(period_col)["Revenue per Headcount ($, company-wide)"].reindex(period_order)
-    st.line_chart(trend)
+    if cadence == "Quarterly":
+        trend = trend.rename(index=R.fmt_period_label)
+    st.line_chart(_chrono_index(trend))
 
 with tab_bva:
-    st.subheader(f"Budget vs Actual — {current_period}")
+    st.subheader(f"Budget vs Actual — {R.fmt_period_label(current_period)}")
     bva_current = bva_df[bva_df[period_col] == current_period]
+    bva_display = bva_current.copy()
+    if cadence == "Quarterly":
+        bva_display[period_col] = bva_display[period_col].map(R.fmt_period_label)
 
     def _bva_row_color(row):
         v = row["Variance (%)"]
@@ -452,7 +499,7 @@ with tab_bva:
         style = f"color: {color}; font-weight: 600"
         return [style if c in ("Variance ($)", "Variance (%)") else "" for c in row.index]
 
-    bva_styler = bva_current.style.format(_base_format_map(bva_current), na_rep="").apply(_bva_row_color, axis=1)
+    bva_styler = bva_display.style.format(_base_format_map(bva_display), na_rep="").apply(_bva_row_color, axis=1)
     st.dataframe(bva_styler, use_container_width=True)
 
     flagged = bva_current[bva_current["Flag"].isin(["Watch", "Major Miss"])]
@@ -506,7 +553,7 @@ with tab_close:
     if resolved_prior_close is not None:
         close_status_caption = (
             f"Autonomous CFO Office, Phases 0-3, run by close_validation.py against the currently-loaded close "
-            f"vs. the latest APPROVED close in Close History ('{resolved_prior_close['period_label']}'). "
+            f"vs. the latest APPROVED close in Close History ('{R.fmt_period_label(resolved_prior_close['period_label'])}'). "
             "Phases 4-6 and 9 are parked pending synthetic controller commentary and are not shown as complete below."
         )
     else:
@@ -576,9 +623,9 @@ with tab_close:
             st.warning(f"{len(phase2_result.flagged_rows)} row(s) changed vs. the latest approved close — see table above.")
 
     st.divider()
-    st.subheader(f"Phase 3 — Plausibility Review (current close, {phase3_result.target_period or 'latest period'} only)")
+    st.subheader(f"Phase 3 — Plausibility Review (current close, {R.fmt_period_label(phase3_result.target_period) or 'latest period'} only)")
     st.caption(
-        f"{phase3_result.target_period or 'The latest period'} has no prior-approved-close counterpart to diff against under "
+        f"{R.fmt_period_label(phase3_result.target_period) or 'The latest period'} has no prior-approved-close counterpart to diff against under "
         "Phase 2, so Phase 3 covers that gap — flagging a Department x Category cell if its QoQ change exceeds "
         f"{phase3_result.threshold:.0%} (set well above the historical max naturally-occurring per-cell move in "
         "this dataset, ~13.1% — see assumptions_and_limitations.md — not tuned to any specific case) with no "
@@ -636,7 +683,7 @@ with tab_close:
         for _, r in phase3_result.flagged_rows.iterrows():
             obs_rows.append({
                 "Detected By": "Phase 3 (Plausibility Review)",
-                "Period": r["Fiscal Quarter"],
+                "Period": R.fmt_period_label(r["Fiscal Quarter"]),
                 "Type": "Plausibility Anomaly",
                 "Department": r["Department"], "Category": r["Category"],
                 "Before ($)": r["Prior ($)"], "After ($)": r["Amount ($)"], "Delta ($)": r["Amount ($)"] - r["Prior ($)"],
@@ -660,7 +707,7 @@ with tab_region_invest:
         "not a full profitability measure."
     )
 
-    st.subheader(f"Revenue, Allocated GTM Cost, and Net of GTM Cost — {current_period}")
+    st.subheader(f"Revenue, Allocated GTM Cost, and Net of GTM Cost — {R.fmt_period_label(current_period)}")
     st.bar_chart(region_cm_df[region_cm_df[period_col] == current_period].set_index("Region")["Region Net of GTM Cost ($)"])
     st.dataframe(fmt_display_df(region_cm_df[region_cm_df[period_col] == current_period][
         ["Region", "Region Revenue ($)", "Allocated S&M + CS Opex ($)", "Region Net of GTM Cost ($)"]
@@ -680,7 +727,9 @@ with tab_region_invest:
         .set_index(period_col)["Region Net of GTM Cost (%)"]
         .reindex(period_order)
     )
-    st.line_chart(region_trend)
+    if cadence == "Quarterly":
+        region_trend = region_trend.rename(index=R.fmt_period_label)
+    st.line_chart(_chrono_index(region_trend))
 
 with tab_product_invest:
     st.title("Product Line Revenue & R&D Investment")
@@ -689,7 +738,7 @@ with tab_product_invest:
         "not a full profitability measure."
     )
 
-    st.subheader(f"Revenue, Allocated R&D Cost, and Net of R&D Cost — {current_period}")
+    st.subheader(f"Revenue, Allocated R&D Cost, and Net of R&D Cost — {R.fmt_period_label(current_period)}")
     st.bar_chart(product_cm_df[product_cm_df[period_col] == current_period].set_index("Product Line")["Product Net of R&D Cost ($)"])
     st.dataframe(fmt_display_df(product_cm_df[product_cm_df[period_col] == current_period][
         ["Product Line", "Product Revenue ($)", "Allocated R&D Opex ($)", "Product Net of R&D Cost ($)"]
@@ -717,10 +766,12 @@ with tab_product_invest:
         .set_index(period_col)["Product Net of R&D Cost (%)"]
         .reindex(period_order)
     )
-    st.line_chart(product_trend)
+    if cadence == "Quarterly":
+        product_trend = product_trend.rename(index=R.fmt_period_label)
+    st.line_chart(_chrono_index(product_trend))
 
 with tab_narr:
-    st.subheader(f"AI-Generated Narrative — {current_period} vs {prior_period}")
+    st.subheader(f"AI-Generated Narrative — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
     st.caption("Uses the exact system + user prompt from northwind_narrative_prompt.md, populated from the tables in the other tabs.")
 
     user_prompt = R.build_user_prompt(
@@ -749,8 +800,8 @@ with tab_narr:
             "system prompt, same rules, same numbers, just a manual hand-off instead of a "
             "live API call."
         )
-        safe_current = current_period.replace(" ", "_")
-        safe_prior = prior_period.replace(" ", "_")
+        safe_current = R.fmt_period_label(current_period).replace(" ", "_")
+        safe_prior = R.fmt_period_label(prior_period).replace(" ", "_")
         filename = f"prompt_{safe_current}_vs_{safe_prior}.txt"
         st.download_button(
             label="Download prompt for this period",
