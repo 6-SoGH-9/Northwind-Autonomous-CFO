@@ -141,6 +141,7 @@ def archive_close(
     close_history_dir=DEFAULT_CLOSE_HISTORY_DIR,
     repo_dir=".",
     extra_metadata=None,
+    commentary_record=None,
 ):
     """Write one immutable snapshot folder under close_history_dir.
 
@@ -151,6 +152,17 @@ def archive_close(
     reflects ACTUAL behavior (AI-generated narrative text, or the rendered
     prompt if no API key was available) rather than assuming a live-API
     path always ran.
+    commentary_record: JSON-serializable dict of the COMPLETE Commentary
+    Record (Phase 4-6 Brief v4, Section F) — original imported version,
+    every subsequent complete revision, each version's stored validation
+    result, and the accepted_version_number, for every observation that had
+    commentary this close. Produced by
+    commentary_workflow.serialize_commentary_records(). Explicitly
+    present-and-{} rather than silently absent when no commentary workflow
+    ran this close (e.g. Cycle 3 Task 1's D10 snapshots, produced before
+    Phase 4-6 existed), so the metadata record is honest about what phase
+    of the product produced a given snapshot. No intermediate commentary
+    version is discarded — this is stored as supplied, verbatim.
     """
     folder = os.path.join(close_history_dir, period_label)
     if os.path.isdir(folder):
@@ -180,6 +192,12 @@ def archive_close(
         # by a missing key.
         "dashboard_html": None,
         "board_deck_pptx": None,
+        # Phase 4-6 Brief v4, Section F: complete Commentary Record captured
+        # at close approval. {} (not None) when no commentary workflow ran
+        # this close, so "ran and found nothing" stays distinguishable from
+        # "this field didn't exist yet" only by the pipeline_git_commit_hash
+        # / snapshot date, not by a silently-different value shape.
+        "commentary_record": commentary_record if commentary_record is not None else {},
     }
     if extra_metadata:
         metadata.update(extra_metadata)

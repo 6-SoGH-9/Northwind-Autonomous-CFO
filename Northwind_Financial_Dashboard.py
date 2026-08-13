@@ -20,6 +20,7 @@ import streamlit as st
 import rollups as R  # noqa: the import itself runs sections 1-14 (all data building)
 import close_history
 import close_validation as CV  # production Phase 2/3 service — Cycle 3 Task 2
+import commentary_workflow as CWF  # Phase 4-6 (D13 scope) — Brief v4
 
 
 GOOD = "#1e8e3e"   # green — favorable variance
@@ -660,45 +661,198 @@ with tab_close:
             st.warning(f"{len(phase3_result.flagged_rows)} plausibility anomalies flagged — see table above.")
 
     st.divider()
-    st.subheader("Observation register (format only — Phase 4-6 not built this cycle)")
+    st.subheader("Observation register")
     st.caption(
-        "Schema Phase 4-6 will consume once Gregory's synthetic commentary is delivered. This register is built "
-        "here in the dashboard from close_validation.py's returned structured results — the production module "
-        "itself never writes an observation register or any other artifact; that's caller-side, same as any "
-        "CSV/report output."
+        "Built here in the dashboard from close_validation.py's returned structured results — the production "
+        "module itself never writes an observation register or any other artifact; that's caller-side, same as "
+        "any CSV/report output. 'Observation ID' is a stable, deterministic key "
+        "(commentary_workflow.make_observation_id) that Phase 4 commentary matching resolves against — "
+        "re-running Phase 2/3 against the same close does not change it."
     )
-    obs_rows = []
-    if phase2_result.status == CV.STATUS_OK:
-        for _, r in phase2_result.flagged_rows.iterrows():
-            obs_rows.append({
-                "Detected By": "Phase 2 (Deterministic Validation)",
-                "Period": r["Date"].strftime("%b %Y") if pd.notna(r["Date"]) else "",
-                "Type": "Historical Revision",
-                "Department": r["Department"], "Category": r["Category"],
-                "Before ($)": r["Amount ($)_prior"], "After ($)": r["Amount ($)_current"], "Delta ($)": r["Diff ($)"],
-                "Commentary Matched": None, "Classification": "Unclassified — awaiting commentary",
-                "Status": "Awaiting Controller Input",
-            })
-    if phase3_result.status == CV.STATUS_OK:
-        for _, r in phase3_result.flagged_rows.iterrows():
-            obs_rows.append({
-                "Detected By": "Phase 3 (Plausibility Review)",
-                "Period": R.fmt_period_label(r["Fiscal Quarter"]),
-                "Type": "Plausibility Anomaly",
-                "Department": r["Department"], "Category": r["Category"],
-                "Before ($)": r["Prior ($)"], "After ($)": r["Amount ($)"], "Delta ($)": r["Amount ($)"] - r["Prior ($)"],
-                "Commentary Matched": None, "Classification": "Unclassified — awaiting commentary",
-                "Status": "Awaiting Controller Input",
-            })
-    observation_register = pd.DataFrame(
-        obs_rows,
-        columns=["Detected By", "Period", "Type", "Department", "Category", "Before ($)", "After ($)",
-                 "Delta ($)", "Commentary Matched", "Classification", "Status"],
-    )
+    observation_register = CWF.build_observation_register(phase2_result, phase3_result, R.fmt_period_label, CV.STATUS_OK)
     if observation_register.empty:
         st.success("No observations this run — register is empty.")
     else:
         st.dataframe(observation_register, use_container_width=True)
+
+    # -----------------------------------------------------------------------
+    # Commentary Review — Phase 4 (Commentary Matching), Phase 5 (Finance
+    # Collaboration, reinterpreted as a self-reference draft for the
+    # finance/CFO user), Phase 6 (Explanation Validation). Governed by
+    # governance/builder_briefs/phase4_6_commentary_validation_brief_v4.md.
+    # Additive: does not touch any D10/D11/D12/D14 logic above.
+    #
+    # Session-scoped state only — the Commentary Record (Brief Section F) is
+    # working-state data before close approval; it is copied into the
+    # immutable D10 Close History snapshot at close approval via
+    # close_history.archive_close(commentary_record=...), demonstrated in
+    # build_test/commentary_workflow_demo.py. The live Human Approval Gate
+    # control (an actual "approve this close" st.button) remains
+    # separately-scoped open technical debt (Handbook Section 10) — this
+    # section does not add one, per the Brief's explicit out-of-scope list.
+    # -----------------------------------------------------------------------
+    st.divider()
+    st.subheader("Commentary Review (Phase 4-6)")
+    st.caption(
+        "Import the Controller's Commentary.xlsx (sheet 'Commentary', columns Commentary_ID + "
+        "Commentary_Text only — no observation ID, status, or AI field in the input file). The Controller "
+        "never operates this dashboard; only the finance/CFO user reviews, edits, and accepts commentary here."
+    )
+
+    if "commentary_records" not in st.session_state:
+        st.session_state["commentary_records"] = {}  # observation_id -> CWF.CommentaryRecord
+    commentary_records = st.session_state["commentary_records"]
+
+    hc_current_df = hc_dept_df[hc_dept_df[period_col] == current_period][["Department", "Ending Headcount"]]
+    hc_prior_df = hc_dept_df[hc_dept_df[period_col] == prior_period][["Department", "Ending Headcount"]]
+
+    def _dept_category_breakdown_for(obs_row):
+        # ALL categories for this department this period (D14), not just the
+        # flagged one -- category_reallocation claims (Phase 6) name a
+        # DIFFERENT category as the true driver, so checking that requires
+        # the full department breakdown, not a single filtered row.
+        matches = exp_dept_cat_df[
+            (exp_dept_cat_df["Department"] == obs_row["Department"])
+            & (exp_dept_cat_df[period_col] == current_period)
+        ]
+        return matches if not matches.empty else None
+
+    def _validate_new_text(text, obs_row):
+        evidence = CWF.build_evidence_package(
+            obs_row, hc_current_df, hc_prior_df,
+            dept_category_breakdown=_dept_category_breakdown_for(obs_row),
+            headcount_band=phase3_result.headcount_band,
+        )
+        return CWF.validate_commentary(text, evidence)
+
+    uploaded = st.file_uploader("Commentary.xlsx", type=["xlsx"], key="commentary_uploader")
+    if uploaded is not None:
+        try:
+            commentary_entries = CWF.load_commentary_workbook(uploaded)
+        except CWF.CommentaryFileError as e:
+            commentary_entries = []
+            st.error(f"Commentary file rejected: {e}")
+
+        if commentary_entries and observation_register.empty:
+            st.info("Commentary file imported, but there are no open observations this period to match against.")
+        elif commentary_entries:
+            match_results = CWF.match_commentary_entries(commentary_entries, observation_register)
+            unmatched = [m for m in match_results if not m.matched]
+
+            for m in match_results:
+                if not m.matched:
+                    continue
+                oid = m.matched_observation_id
+                record = commentary_records.get(oid) or CWF.CommentaryRecord(observation_id=oid)
+                # Idempotent across reruns: only add the original-import
+                # version once per (observation, exact text) pair — a rerun
+                # must never duplicate it.
+                if not any(v.source == CWF.SOURCE_ORIGINAL_IMPORT and v.text == m.text for v in record.versions):
+                    obs_row = observation_register[observation_register["Observation ID"] == oid].iloc[0]
+                    result = _validate_new_text(m.text, obs_row)
+                    record.add_version(m.text, CWF.SOURCE_ORIGINAL_IMPORT, "controller_import", result)
+                commentary_records[oid] = record
+
+            if unmatched:
+                st.warning(
+                    f"{len(unmatched)} commentary entr{'y' if len(unmatched) == 1 else 'ies'} could not be "
+                    "confidently matched — manual reconciliation below (a dashboard action, not routed to "
+                    "the Controller)."
+                )
+                for m in unmatched:
+                    with st.expander(f"Unmatched: {m.commentary_id}"):
+                        st.write(m.text)
+                        st.caption(CWF.draft_finance_note(no_match_reason=m.match_basis))
+                        manual_obs = st.selectbox(
+                            "Manually associate with observation",
+                            ["(select)"] + observation_register["Observation ID"].tolist(),
+                            key=f"manual_{m.commentary_id}",
+                        )
+                        if manual_obs != "(select)" and st.button("Confirm manual match", key=f"confirm_{m.commentary_id}"):
+                            record = commentary_records.get(manual_obs) or CWF.CommentaryRecord(observation_id=manual_obs)
+                            obs_row = observation_register[observation_register["Observation ID"] == manual_obs].iloc[0]
+                            result = _validate_new_text(m.text, obs_row)
+                            record.add_version(m.text, CWF.SOURCE_ORIGINAL_IMPORT, "controller_import", result)
+                            commentary_records[manual_obs] = record
+                            st.rerun()
+
+    if not commentary_records:
+        st.caption("No commentary imported yet this session.")
+    else:
+        commented_ids = set(commentary_records.keys())
+        open_uncommented = (
+            observation_register[~observation_register["Observation ID"].isin(commented_ids)]
+            if not observation_register.empty else observation_register
+        )
+        if not open_uncommented.empty:
+            st.info(f"{len(open_uncommented)} open observation(s) have no matching commentary yet.")
+            st.dataframe(open_uncommented, use_container_width=True)
+
+        for oid, record in commentary_records.items():
+            obs_matches = observation_register[observation_register["Observation ID"] == oid]
+            if obs_matches.empty or not record.versions:
+                continue
+            obs_row = obs_matches.iloc[0]
+            latest = record.versions[-1]
+            status_label = latest.validation_result.assessment if latest.validation_result else "unvalidated"
+            with st.expander(
+                f"{obs_row['Department']} / {obs_row['Category']} ({obs_row['Period']}) — {status_label}",
+                expanded=(record.accepted_version_number is None),
+            ):
+                st.markdown(
+                    f"**Observation:** {obs_row['Detected By']}, "
+                    f"${obs_row['Before ($)']:,.2f} → ${obs_row['After ($)']:,.2f} "
+                    f"(Δ ${obs_row['Delta ($)']:,.2f})"
+                )
+                st.markdown(f"**Current commentary — version {latest.version_number} ({latest.source}):**")
+                st.write(latest.text)
+
+                if latest.validation_result is not None:
+                    vr = latest.validation_result
+                    st.markdown(f"**Phase 6 result: {vr.assessment}**")
+                    st.caption(vr.reason)
+                    if vr.cited_field:
+                        st.caption(f"Cited evidence field: {vr.cited_field} = {vr.cited_value}")
+                    tc = st.columns(4)
+                    tc[0].metric("1. Specific claim?", "Yes" if vr.check1_specific_claim else "No")
+                    tc[1].metric("2. Checkable?", "—" if vr.check2_checkable is None else ("Yes" if vr.check2_checkable else "No"))
+                    tc[2].metric("3. Supported?", "—" if vr.check3_supported is None else ("Yes" if vr.check3_supported else "No"))
+                    tc[3].metric("4. Specific enough?", "—" if vr.check4_sufficiently_specific is None else ("Yes" if vr.check4_sufficiently_specific else "No"))
+                    if vr.assessment == CWF.INSUFFICIENT:
+                        st.info(f"For your reference: {CWF.draft_finance_note(phase6_result=vr)}")
+
+                revised_text = st.text_area("Edit complete commentary text", value=latest.text, key=f"edit_text_{oid}")
+                if st.button("Submit revision & revalidate", key=f"submit_{oid}"):
+                    if revised_text.strip() and revised_text.strip() != latest.text.strip():
+                        new_result = _validate_new_text(revised_text.strip(), obs_row)
+                        record.add_version(revised_text.strip(), CWF.SOURCE_USER_REVISION, "finance_cfo_user", new_result)
+                        st.rerun()
+                    else:
+                        st.warning("No change detected — edit the text before submitting.")
+
+                st.markdown("**Version history**")
+                hist_df = pd.DataFrame([{
+                    "Version": v.version_number, "Source": v.source, "Submitted": v.timestamp,
+                    "Assessment": v.validation_result.assessment if v.validation_result else "—",
+                    "Accepted": "✅" if record.accepted_version_number == v.version_number else "",
+                } for v in record.versions])
+                st.dataframe(hist_df, use_container_width=True)
+
+                accept_choice = st.selectbox(
+                    "Mark version as Accepted", [v.version_number for v in record.versions],
+                    index=len(record.versions) - 1, key=f"accept_select_{oid}",
+                )
+                if st.button("Mark Accepted", key=f"accept_btn_{oid}"):
+                    record.mark_accepted(accept_choice)
+                    st.success(f"Version {accept_choice} marked Accepted for this observation.")
+                    st.rerun()
+
+        accepted_lines_preview = CWF.accepted_commentary_prompt_lines(commentary_records, observation_register)
+        if accepted_lines_preview:
+            st.divider()
+            st.caption("Accepted commentary that will flow into the executive narrative (Phase 7, Section G handoff):")
+            for line in accepted_lines_preview:
+                st.write(line)
 
 with tab_region_invest:
     st.title("Regional Revenue & Go-to-Market Investment")
@@ -774,10 +928,22 @@ with tab_narr:
     st.subheader(f"AI-Generated Narrative — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
     st.caption("Uses the exact system + user prompt from northwind_narrative_prompt.md, populated from the tables in the other tabs.")
 
+    # Section G handoff (Phase 4-6 Brief v4): only ACCEPTED commentary
+    # versions reach the narrative prompt, traceably. Empty/absent when no
+    # commentary workflow has run this session — existing narrative
+    # generation behavior for any close with no observations is unchanged.
+    # observation_register is built earlier in this same script run, inside
+    # the tab_close block above -- Streamlit executes every tab's body every
+    # rerun regardless of which tab is visually active, so it's always
+    # defined by this point.
+    _accepted_lines = CWF.accepted_commentary_prompt_lines(
+        st.session_state.get("commentary_records", {}), observation_register
+    )
     user_prompt = R.build_user_prompt(
         period_col, period_order, current_period, prior_period, prior_period,
         pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
         exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
+        accepted_commentary_lines=_accepted_lines,
     )
 
     with st.expander("View rendered prompt (data sent to the model)"):

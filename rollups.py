@@ -1127,7 +1127,8 @@ def fmt_pct(x):
 
 def build_user_prompt(period_col, period_order, current_period, prior_period, comparison_label,
                        pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
-                       exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df):
+                       exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
+                       accepted_commentary_lines=None):
     pl_row = pl_df[pl_df[period_col] == current_period].iloc[0]
     pl_prior_row = pl_df[pl_df[period_col] == prior_period].iloc[0] if prior_period in pl_df[period_col].values else None
 
@@ -1215,6 +1216,24 @@ def build_user_prompt(period_col, period_order, current_period, prior_period, co
     if not bva_lines:
         bva_lines = ["  (none flagged Watch or Major Miss this period)"]
 
+    # Phase 4-6 Brief v4, Section G — Executive-Output Handoff. Optional:
+    # accepted_commentary_lines is None for any caller that hasn't built a
+    # Commentary Record yet (e.g. existing Cycle 2/3 callers, and the
+    # bootstrap/no-observations case), so this is purely additive and does
+    # not change output for any prompt built before Phase 4-6 existed.
+    # Each line is traceable to a specific ACCEPTED commentary version only
+    # (commentary_workflow.accepted_commentary_prompt_lines never returns an
+    # unaccepted, superseded, or AI-generated substitute).
+    if accepted_commentary_lines:
+        accepted_commentary_block = (
+            "\nFinance/CFO-Approved Explanations (accepted commentary, human-reviewed):\n"
+            + chr(10).join(accepted_commentary_lines)
+            + "\n(These are human-approved explanations for flagged items this period — treat them as "
+              "established context, not something to re-derive or second-guess.)"
+        )
+    else:
+        accepted_commentary_block = ""
+
     prompt = f"""Period: {fmt_period_label(current_period)}
 Comparison basis: vs. {fmt_period_label(comparison_label)}
 
@@ -1257,6 +1276,7 @@ Headcount:
 Budget vs Actual — flagged items only (Watch or Major Miss):
 {chr(10).join(bva_lines)}
 (Flag thresholds: |Variance %| > 8% = Major Miss, > 4% = Watch, else On Track.)
+{accepted_commentary_block}
 
 TASK:
 Write commentary under these section headers, in this order:
