@@ -1128,7 +1128,7 @@ def fmt_pct(x):
 def build_user_prompt(period_col, period_order, current_period, prior_period, comparison_label,
                        pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
                        exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
-                       accepted_commentary_lines=None):
+                       accepted_commentary_lines=None, commentary_narrative_block=None):
     pl_row = pl_df[pl_df[period_col] == current_period].iloc[0]
     pl_prior_row = pl_df[pl_df[period_col] == prior_period].iloc[0] if prior_period in pl_df[period_col].values else None
 
@@ -1216,15 +1216,25 @@ def build_user_prompt(period_col, period_order, current_period, prior_period, co
     if not bva_lines:
         bva_lines = ["  (none flagged Watch or Major Miss this period)"]
 
-    # Phase 4-6 Brief v4, Section G — Executive-Output Handoff. Optional:
-    # accepted_commentary_lines is None for any caller that hasn't built a
-    # Commentary Record yet (e.g. existing Cycle 2/3 callers, and the
-    # bootstrap/no-observations case), so this is purely additive and does
-    # not change output for any prompt built before Phase 4-6 existed.
-    # Each line is traceable to a specific ACCEPTED commentary version only
-    # (commentary_workflow.accepted_commentary_prompt_lines never returns an
-    # unaccepted, superseded, or AI-generated substitute).
-    if accepted_commentary_lines:
+    # Phase 4-6, Section G — Executive-Output Handoff.
+    #
+    # v5 (current): commentary_narrative_block is a single, fully-rendered
+    # string built by commentary_workflow.build_narrative_commentary_section(),
+    # which already implements the required three-way logic (no flags / flags
+    # + file supplied [accepted + unresolved] / flags + no file supplied
+    # [unexplained]) — this function just inserts it verbatim. When no block
+    # is passed (None), this is "" for any caller that predates Phase 4-6 or
+    # has zero observations, preserving byte-identical prompt output for
+    # those cases (Brief v5 Section G, Criterion 1).
+    #
+    # accepted_commentary_lines (v4) is kept for backward compatibility with
+    # callers that pass only a flat list of accepted-commentary lines and
+    # never built a three-way block (e.g. the v4 Builder fixture) — used
+    # only when commentary_narrative_block is not supplied, so it never
+    # overrides the v5 three-way block.
+    if commentary_narrative_block:
+        accepted_commentary_block = commentary_narrative_block
+    elif accepted_commentary_lines:
         accepted_commentary_block = (
             "\nFinance/CFO-Approved Explanations (accepted commentary, human-reviewed):\n"
             + chr(10).join(accepted_commentary_lines)

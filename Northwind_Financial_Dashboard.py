@@ -696,12 +696,27 @@ with tab_close:
     st.caption(
         "Import the Controller's Commentary.xlsx (sheet 'Commentary', columns Commentary_ID + "
         "Commentary_Text only — no observation ID, status, or AI field in the input file). The Controller "
-        "never operates this dashboard; only the finance/CFO user reviews, edits, and accepts commentary here."
+        "never operates this dashboard; only the finance/CFO user reviews, edits, and accepts commentary here. "
+        "This file is OPTIONAL (Brief v5) — the dashboard, financial analysis, and executive narrative all "
+        "work correctly with no commentary file at all; flagged observations are simply reported as "
+        "identified-but-unexplained in that case (see the AI Narrative tab)."
     )
 
     if "commentary_records" not in st.session_state:
         st.session_state["commentary_records"] = {}  # observation_id -> CWF.CommentaryRecord
     commentary_records = st.session_state["commentary_records"]
+
+    # Brief v5, Section A/B/K: Commentary.xlsx is now OPTIONAL. Whether a
+    # file was ever supplied this close is tracked independently of the
+    # file_uploader widget's current value, because Streamlit's uploader can
+    # report None on a later rerun (e.g. widget state edge cases) even after
+    # a file was genuinely supplied earlier this session -- Section G's
+    # three-way narrative handoff needs a durable "was one supplied at all"
+    # answer for this close, not just "is one attached to the widget right
+    # now." Once True for this session, it stays True (a close doesn't un-
+    # supply a commentary file mid-review).
+    if "commentary_file_supplied" not in st.session_state:
+        st.session_state["commentary_file_supplied"] = False
 
     hc_current_df = hc_dept_df[hc_dept_df[period_col] == current_period][["Department", "Ending Headcount"]]
     hc_prior_df = hc_dept_df[hc_dept_df[period_col] == prior_period][["Department", "Ending Headcount"]]
@@ -725,8 +740,9 @@ with tab_close:
         )
         return CWF.validate_commentary(text, evidence)
 
-    uploaded = st.file_uploader("Commentary.xlsx", type=["xlsx"], key="commentary_uploader")
+    uploaded = st.file_uploader("Commentary.xlsx (optional)", type=["xlsx"], key="commentary_uploader")
     if uploaded is not None:
+        st.session_state["commentary_file_supplied"] = True
         try:
             commentary_entries = CWF.load_commentary_workbook(uploaded)
         except CWF.CommentaryFileError as e:
@@ -928,22 +944,26 @@ with tab_narr:
     st.subheader(f"AI-Generated Narrative — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
     st.caption("Uses the exact system + user prompt from northwind_narrative_prompt.md, populated from the tables in the other tabs.")
 
-    # Section G handoff (Phase 4-6 Brief v4): only ACCEPTED commentary
-    # versions reach the narrative prompt, traceably. Empty/absent when no
-    # commentary workflow has run this session — existing narrative
-    # generation behavior for any close with no observations is unchanged.
-    # observation_register is built earlier in this same script run, inside
-    # the tab_close block above -- Streamlit executes every tab's body every
-    # rerun regardless of which tab is visually active, so it's always
-    # defined by this point.
-    _accepted_lines = CWF.accepted_commentary_prompt_lines(
-        st.session_state.get("commentary_records", {}), observation_register
+    # Section G handoff (Brief v5, rewritten this revision): three required
+    # states, not two -- no flags / flags+file-supplied (accepted+unresolved)
+    # / flags+no-file-supplied (unexplained, no cause invented). Determined
+    # here from (a) observation_register (built earlier in the tab_close
+    # block above -- Streamlit executes every tab's body every rerun
+    # regardless of which tab is visually active, so it's always defined by
+    # this point) and (b) commentary_file_supplied, tracked durably across
+    # this session (see Commentary Review section above). Byte-identical to
+    # pre-Phase-4-6 behavior whenever observation_register is empty,
+    # regardless of commentary-file presence (Brief Section G, Criterion 1).
+    _commentary_block = CWF.build_narrative_commentary_section(
+        observation_register,
+        st.session_state.get("commentary_records", {}),
+        st.session_state.get("commentary_file_supplied", False),
     )
     user_prompt = R.build_user_prompt(
         period_col, period_order, current_period, prior_period, prior_period,
         pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
         exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
-        accepted_commentary_lines=_accepted_lines,
+        commentary_narrative_block=_commentary_block,
     )
 
     with st.expander("View rendered prompt (data sent to the model)"):

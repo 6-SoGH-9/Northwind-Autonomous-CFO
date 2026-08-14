@@ -9,7 +9,12 @@ Implements:
   - Commentary Record / version model    (Brief Section F)
   - Executive-output handoff helper      (Brief Section G)
 
-Governs: governance/builder_briefs/phase4_6_commentary_validation_brief_v4.md
+Governs: governance/builder_briefs/phase4_6_commentary_validation_brief_v5.md
+  (v5 supersedes v4; v4's Sections C, D, F, H, J are unchanged and v4's
+  implementation of them is not reopened or redone here — see v5 Revision
+  Note. v5 adds: Commentary.xlsx becomes optional (Section A/B), and Section
+  G's Phase 7 handoff is rewritten from a binary framing into the three
+  required states below.)
 Constrained by: D13 (Machine Recommends, Human Decides) — Planned. This
 module never sets, implies, or influences close approval/rejection status.
 
@@ -765,10 +770,16 @@ def serialize_commentary_records(records_by_observation_id):
 # Section G — Executive-output handoff
 # ---------------------------------------------------------------------------
 def accepted_commentary_prompt_lines(records_by_observation_id, observation_register):
-    """Phase 7 reads ONLY the text of the version marked accepted_version_number
-    -- never an unaccepted, superseded, or AI-generated substitute (Brief
+    """v4-era helper, unchanged behavior, still used by the dashboard's own
+    'accepted commentary preview' panel (Section E display only). Phase 7
+    reads ONLY the text of the version marked accepted_version_number --
+    never an unaccepted, superseded, or AI-generated substitute (Brief
     Section G). Returns formatted lines, each traceable to a specific
-    accepted commentary version, ready to append to the narrative prompt."""
+    accepted commentary version.
+
+    NOT used directly for the narrative prompt as of v5 -- see
+    build_narrative_commentary_section() below, which wraps this same
+    "accepted only" rule inside the required three-way Section G logic."""
     lines = []
     for oid, rec in records_by_observation_id.items():
         text = rec.accepted_text()
@@ -783,3 +794,92 @@ def accepted_commentary_prompt_lines(records_by_observation_id, observation_regi
             f"{text} [accepted version {rec.accepted_version_number}]"
         )
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Section G — Executive-output handoff, THREE-WAY (Brief v5, rewritten)
+# ---------------------------------------------------------------------------
+def _obs_label(obs_row):
+    return f"{obs_row['Department']} / {obs_row['Category']} ({obs_row['Period']}, {obs_row['Type']})"
+
+
+def build_narrative_commentary_section(observation_register, records_by_observation_id, commentary_file_supplied):
+    """Brief v5, Section G. Determines which of the three required states
+    applies and returns a single formatted block ready to insert into
+    rollups.build_user_prompt()'s prompt (empty string if nothing to add).
+
+    Three states, in order, first match wins:
+
+      1. No flags at all (observation_register is empty). Commentary-file
+         presence is irrelevant. Returns "" -- byte-identical to
+         pre-Phase-4-6 behavior for this case (Brief Section G, Criterion 1).
+
+      2. Flags exist AND a commentary file was supplied this close.
+         - Each flagged observation with an ACCEPTED version: reported via
+           the existing v4 "Finance/CFO-Approved Explanations" block
+           (accepted_commentary_prompt_lines(), unchanged).
+         - Each flagged observation with NO accepted version (never matched,
+           matched but never resubmitted past Insufficient/Contradicted, or
+           simply never reviewed): reported as UNRESOLVED -- a commentary
+           process was attempted for this close but did not conclude.
+
+      3. Flags exist AND no commentary file was supplied at all. Every
+         flagged observation is reported as UNEXPLAINED -- identified by
+         Phase 2/3, no Controller commentary was ever supplied this close.
+         No cause is invented to fill the gap.
+
+    Case 2's "unresolved" wording and Case 3's "unexplained, no commentary
+    supplied" wording are deliberately distinct strings (Brief Section G,
+    Criterion 4) so a reader -- human or the narrative-generation model --
+    can tell which situation produced an unexplained item.
+    """
+    # Case 1 — no flags at all. Commentary-file presence is irrelevant.
+    if observation_register is None or observation_register.empty:
+        return ""
+
+    # Case 3 — flags exist, no commentary file was ever supplied this close.
+    if not commentary_file_supplied:
+        lines = [
+            f"  - {_obs_label(obs)}: identified by Phase 2/3 validation; no Controller commentary "
+            f"was supplied for this close; UNEXPLAINED (no commentary process occurred for this item)."
+            for _, obs in observation_register.iterrows()
+        ]
+        return (
+            "\nFlagged Observations — No Commentary Supplied This Close:\n"
+            + "\n".join(lines)
+            + "\n(No Commentary.xlsx was provided for this close. These items were identified by automated "
+              "validation only and have no Controller explanation of any kind. Do not infer, guess, or invent "
+              "a cause for any item in this list -- state plainly that it is unexplained.)"
+        )
+
+    # Case 2 — flags exist, a commentary file WAS supplied this close.
+    accepted_lines = accepted_commentary_prompt_lines(records_by_observation_id, observation_register)
+    unresolved_lines = []
+    for _, obs in observation_register.iterrows():
+        oid = obs["Observation ID"]
+        rec = records_by_observation_id.get(oid)
+        if rec is not None and rec.accepted_text() is not None:
+            continue  # already covered by accepted_lines
+        unresolved_lines.append(
+            f"  - {_obs_label(obs)}: identified by Phase 2/3 validation; a commentary process was "
+            f"attempted for this close but no accepted explanation currently exists; UNRESOLVED "
+            f"(commentary process incomplete, not absent)."
+        )
+
+    blocks = []
+    if accepted_lines:
+        blocks.append(
+            "\nFinance/CFO-Approved Explanations (accepted commentary, human-reviewed):\n"
+            + "\n".join(accepted_lines)
+            + "\n(These are human-approved explanations for flagged items this period -- treat them as "
+              "established context, not something to re-derive or second-guess.)"
+        )
+    if unresolved_lines:
+        blocks.append(
+            "\nFlagged Observations — Unresolved (commentary process incomplete):\n"
+            + "\n".join(unresolved_lines)
+            + "\n(A commentary file was supplied for this close, but these items do not yet have an "
+              "accepted explanation. Do not infer, guess, or invent a cause for any item in this list -- "
+              "state plainly that it remains unresolved.)"
+        )
+    return "".join(blocks)
