@@ -572,13 +572,52 @@ with tab_close:
     any_flags_found = (phase2_ran and len(phase2_result.flagged_rows) > 0) or (
         phase3_result.status == CV.STATUS_OK and len(phase3_result.flagged_rows) > 0
     )
+
+    # Human Approval Gate (Brief human_approval_gate_brief_v1.md), Section
+    # B.4: the two rows below must reflect real computed state, not the
+    # hardcoded False that previously sat here unconditionally. Both
+    # booleans are computed here, ahead of the Commentary Review section's
+    # own build of the same observation register further down this tab, so
+    # the strip reflects the CURRENT rerun's state rather than a stale
+    # value. build_observation_register() is a pure function of
+    # phase2_result/phase3_result (already computed above) with no side
+    # effects, so recomputing it here is safe and does not duplicate any
+    # stateful logic -- see the Commentary Review section for the
+    # authoritative build used for matching/display.
+    _status_strip_observation_register = CWF.build_observation_register(
+        phase2_result, phase3_result, R.fmt_period_label, CV.STATUS_OK
+    )
+    _status_strip_commentary_records = st.session_state.get("commentary_records", {})
+    if _status_strip_observation_register.empty:
+        # Nothing was ever flagged this close -- Phase 6 has nothing to do,
+        # so "Explanations Validated" is trivially satisfied.
+        explanations_validated = True
+    else:
+        _commented_ids = set(_status_strip_commentary_records.keys())
+        _open_uncommented_ids = set(_status_strip_observation_register["Observation ID"]) - _commented_ids
+        explanations_validated = (
+            len(_open_uncommented_ids) == 0
+            and all(
+                rec.versions and rec.versions[-1].validation_result is not None
+                for rec in _status_strip_commentary_records.values()
+            )
+        )
+    # Human Approval Gate, Section B.1/D: the close's approval status is a
+    # distinct, explicit human action (approve/reject buttons, Commentary
+    # Review section) -- never inferred from Phase 6 assessment outcomes.
+    # "Executive Ready" is real only once that explicit action has set this
+    # to "approved".
+    if "close_approval_status" not in st.session_state:
+        st.session_state["close_approval_status"] = "not_yet_decided"
+    executive_ready = st.session_state["close_approval_status"] == "approved"
+
     states = [
         ("Close Received", "Phase 0", True),
         ("Data Validated", "Phase 2 complete" if phase2_ran else "Phase 2 not applicable (no prior close)", True),
         ("Observations Generated", "Phase 3 complete", phase3_result.status == CV.STATUS_OK),
         ("Awaiting Controller Input", "unexplained items exist" if any_flags_found else "no items awaiting explanation", any_flags_found),
-        ("Explanations Validated", "Phase 6 complete", False),
-        ("Executive Ready", "human approval gate passed", False),
+        ("Explanations Validated", "Phase 6 complete", explanations_validated),
+        ("Executive Ready", "human approval gate passed", executive_ready),
         ("Published", "Phase 8 outputs delivered", False),
         ("Archived", "Phase 9 log entry written", False),
     ]
@@ -842,6 +881,15 @@ with tab_close:
                     if revised_text.strip() and revised_text.strip() != latest.text.strip():
                         new_result = _validate_new_text(revised_text.strip(), obs_row)
                         record.add_version(revised_text.strip(), CWF.SOURCE_USER_REVISION, "finance_cfo_user", new_result)
+                        # Human Approval Gate, Section B.6: revising
+                        # commentary after this close was already approved
+                        # invalidates that approval -- the human approved a
+                        # specific set of explanations, and that set just
+                        # changed. Reset to not-yet-decided so Phase 7 is
+                        # blocked again until the close is re-approved.
+                        # No-op if the close wasn't already approved.
+                        if st.session_state.get("close_approval_status") == "approved":
+                            st.session_state["close_approval_status"] = "not_yet_decided"
                         st.rerun()
                     else:
                         st.warning("No change detected — edit the text before submitting.")
@@ -869,6 +917,52 @@ with tab_close:
             st.caption("Accepted commentary that will flow into the executive narrative (Phase 7, Section G handoff):")
             for line in accepted_lines_preview:
                 st.write(line)
+
+    # ---------------------------------------------------------------------
+    # Human Approval Gate (Brief human_approval_gate_brief_v1.md), Section
+    # B.2/B.5/B.7. Two distinct, explicit human actions -- approve and
+    # reject/return. Per D13 ("Machine Recommends, Human Decides") and
+    # Section B.5, the approve control's availability must NOT depend on
+    # any Phase 6 assessment (Supported/Contradicted/Insufficient) or on
+    # whether commentary exists at all -- an adverse or missing assessment
+    # is a flag for the human, never a block on the human's own
+    # discretion. This is why these two buttons sit outside the
+    # `if not commentary_records:` branch above (which only gates the
+    # display of commentary review content, not this gate) and are always
+    # rendered, every rerun, at the end of Commentary Review section.
+    # ---------------------------------------------------------------------
+    st.divider()
+    st.subheader("Close Approval — Human Approval Gate")
+    _approval_status = st.session_state.get("close_approval_status", "not_yet_decided")
+    _status_display = {
+        "not_yet_decided": "⬜ Not yet decided",
+        "approved": "✅ Approved",
+        "rejected": "❌ Rejected / returned",
+    }[_approval_status]
+    st.markdown(f"**Current status:** {_status_display}")
+    st.caption(
+        "This action is independent of Phase 6's assessment of any individual commentary item. "
+        "An Insufficient or Contradicted result (or no commentary at all) is a flag for you to "
+        "review, not a block on your discretion to approve, reject, or request further "
+        "clarification (D13)."
+    )
+    gate_cols = st.columns(2)
+    with gate_cols[0]:
+        if st.button("Approve close", key="approve_close_btn"):
+            # Section D: available in every state, including re-affirming
+            # an already-approved close.
+            st.session_state["close_approval_status"] = "approved"
+            st.rerun()
+    with gate_cols[1]:
+        if st.button("Reject / return close", key="reject_close_btn"):
+            # Section B.7: no reason required. No-op in substance if
+            # already rejected (still explicitly sets rejected, per
+            # Section D's table) or not-yet-decided. The existing Phase 6
+            # revision loop (commentary edit + resubmit, above) is the
+            # path back toward re-approval -- this Brief does not add a
+            # separate return-reason mechanism.
+            st.session_state["close_approval_status"] = "rejected"
+            st.rerun()
 
 with tab_region_invest:
     st.title("Regional Revenue & Go-to-Market Investment")
@@ -969,30 +1063,55 @@ with tab_narr:
     with st.expander("View rendered prompt (data sent to the model)"):
         st.text(user_prompt)
 
-    api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    # ---------------------------------------------------------------------
+    # Human Approval Gate (Brief human_approval_gate_brief_v1.md), Section
+    # A/E, Criteria 1-3. STRUCTURAL gate, not cosmetic: when the close is
+    # not approved, the code paths that call R.call_claude_narrative() and
+    # that build the download button simply do not execute at all -- they
+    # sit inside the `if _gate_approved:` branch below, which is False
+    # whenever close_approval_status != "approved". There is no sequence
+    # of reruns or widget interactions that reaches either action without
+    # that session-state value having been set to "approved" first (via
+    # the explicit Approve button in the Commentary Review section above,
+    # tab_close -- the only place that sets it). Per D13, no Phase 6
+    # assessment outcome, however favorable, sets or implies this value;
+    # only that explicit human action does.
+    # ---------------------------------------------------------------------
+    _gate_approved = st.session_state.get("close_approval_status", "not_yet_decided") == "approved"
 
-    if api_key_present:
-        if st.button("Generate narrative", type="primary"):
-            with st.spinner("Calling Claude..."):
-                narrative, error = R.call_claude_narrative(user_prompt)
-            if narrative:
-                st.markdown(narrative.replace("\n\n", "\n\n> ").replace("\n", "\n\n"))
-            else:
-                st.error(error)
+    if not _gate_approved:
+        st.warning(
+            "**This close has not been approved.** Executive narrative generation and the prompt "
+            "download are unavailable until a human approves this close via the Close Approval "
+            "control on the Close Validation Status tab. This applies regardless of Phase 6 "
+            "validation results — an adverse or absent assessment does not block approval, and a "
+            "favorable one does not substitute for it (D13, Human Approval Gate)."
+        )
     else:
-        st.info(
-            "No ANTHROPIC_API_KEY found in this environment. Download the rendered prompt "
-            "below and paste it into a Claude chat to generate the narrative manually — same "
-            "system prompt, same rules, same numbers, just a manual hand-off instead of a "
-            "live API call."
-        )
-        safe_current = R.fmt_period_label(current_period).replace(" ", "_")
-        safe_prior = R.fmt_period_label(prior_period).replace(" ", "_")
-        filename = f"prompt_{safe_current}_vs_{safe_prior}.txt"
-        st.download_button(
-            label="Download prompt for this period",
-            data=user_prompt,
-            file_name=filename,
-            mime="text/plain",
-            type="primary",
-        )
+        api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+        if api_key_present:
+            if st.button("Generate narrative", type="primary"):
+                with st.spinner("Calling Claude..."):
+                    narrative, error = R.call_claude_narrative(user_prompt)
+                if narrative:
+                    st.markdown(narrative.replace("\n\n", "\n\n> ").replace("\n", "\n\n"))
+                else:
+                    st.error(error)
+        else:
+            st.info(
+                "No ANTHROPIC_API_KEY found in this environment. Download the rendered prompt "
+                "below and paste it into a Claude chat to generate the narrative manually — same "
+                "system prompt, same rules, same numbers, just a manual hand-off instead of a "
+                "live API call."
+            )
+            safe_current = R.fmt_period_label(current_period).replace(" ", "_")
+            safe_prior = R.fmt_period_label(prior_period).replace(" ", "_")
+            filename = f"prompt_{safe_current}_vs_{safe_prior}.txt"
+            st.download_button(
+                label="Download prompt for this period",
+                data=user_prompt,
+                file_name=filename,
+                mime="text/plain",
+                type="primary",
+            )
