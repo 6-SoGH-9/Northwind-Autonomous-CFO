@@ -428,9 +428,100 @@ def _classify_claim_type(text):
     return None, False
 
 
+# ---------------------------------------------------------------------------
+# Headcount claim DIRECTION parsing (Brief:
+# phase6_headcount_direction_fix_brief_v1.md, Section C1).
+#
+# Business rule: a headcount-type claim asserts one of four things about
+# the direction of the department's own headcount movement -- "increase",
+# "decrease", "no change", or nothing discernible ("unspecified"). Prior to
+# this fix, _validate_headcount_claim() never parsed this at all; it only
+# checked whether the movement was material and, if so, compared the
+# ACTUAL headcount-change sign against the ACTUAL variance sign -- never
+# against what the commentary claimed. That meant a claim of "increase" and
+# a claim of "no change" against the same evidence produced byte-identical
+# results. This function is the fix: it parses the commentary text only,
+# independent of any evidence figure, and returns the asserted direction so
+# the caller can compare it against the actual headcount_change value.
+#
+# "backfill" is deliberately NOT decrease-only: replacing a departure is
+# direction-neutral on its own (net headcount may be flat). It only counts
+# as a decrease assertion if the SAME claim also contains an unambiguous
+# decrease term elsewhere in the text.
+_HEADCOUNT_INCREASE_TERMS = [
+    "increase", "hire", "hiring", "hired", "grew", "grow", "added", "expand", "expanded", "expansion",
+]
+_HEADCOUNT_DECREASE_TERMS = [
+    "decrease", "layoff", "layoffs", "reduction", "reduced", "reduce", "attrition",
+]
+_HEADCOUNT_NO_CHANGE_TERMS = [
+    "no change", "unchanged", "flat", "stayed the same", "did not change", "hasn't changed", "has not changed",
+]
+
+
+def _parse_headcount_direction(text):
+    """Section C1. Returns one of "increase", "decrease", "no_change", or
+    "unspecified". Evaluated independent of whether the text contains a
+    number -- direction and materiality are separate questions (Section C3
+    keeps them separate on purpose)."""
+    lower = text.lower()
+
+    if any(term in lower for term in _HEADCOUNT_NO_CHANGE_TERMS):
+        return "no_change"
+
+    has_increase = any(term in lower for term in _HEADCOUNT_INCREASE_TERMS)
+    has_decrease = any(term in lower for term in _HEADCOUNT_DECREASE_TERMS)
+
+    if has_increase and not has_decrease:
+        return "increase"
+    if has_decrease and not has_increase:
+        return "decrease"
+    if has_increase and has_decrease:
+        # Both an explicit increase and an explicit decrease term present --
+        # genuinely ambiguous within the claim itself, not a case this Brief
+        # is asked to disambiguate further. Falls through to "backfill"
+        # check below (moot, since has_decrease is already True here) and
+        # then to unspecified.
+        return "unspecified"
+
+    if "backfill" in lower:
+        # Backfill alone is direction-neutral (Section C1) -- it only
+        # resolves to "decrease" if paired with an unambiguous decrease
+        # term, which would already have set has_decrease above. Reaching
+        # here means "backfill" is the only signal present, so unspecified.
+        return "unspecified"
+
+    return "unspecified"
+
+
 def _validate_headcount_claim(text, evidence):
     """Check 3/4 for claim_type == 'headcount', backed by
-    evidence['headcount_change'] / evidence['variance_pct']."""
+    evidence['headcount_change'] / evidence['variance_pct'].
+
+    Business rule (Brief phase6_headcount_direction_fix_brief_v1.md,
+    Section C3), applied in this order:
+      1. Parse the ASSERTED direction from the commentary text alone
+         (increase / decrease / no_change / unspecified) -- see
+         _parse_headcount_direction() above.
+      2. If unspecified: route to the existing genericity check (Check 4)
+         -> Insufficient. This does NOT fall through to a variance-sign
+         default -- that was the pre-fix defect.
+      3. If "no_change": immaterial actual movement (|change| <= band) is
+         CONSISTENT with the claim -> Supported. A material actual movement
+         directly contradicts the claim's own premise -> Contradicted.
+      4. If "increase" or "decrease": an immaterial actual movement fails
+         the materiality gate regardless of asserted direction ->
+         Contradicted, reason text explicitly names this a materiality-gate
+         result (not a direction mismatch -- none exists to report yet,
+         since the movement isn't even large enough to have a meaningful
+         direction). A material movement is then compared: matching sign ->
+         Supported; opposite sign -> Contradicted, reason text explicitly
+         names this a direction mismatch.
+    The materiality band itself (default 2, same value and role as
+    close_validation.py's DEFAULT_PLAUSIBILITY_HEADCOUNT_BAND) is
+    unchanged by this fix -- only what the movement is compared against
+    (asserted claim direction, not actual variance direction) has changed.
+    """
     hc_change = evidence.get("headcount_change")
     variance_pct = evidence.get("variance_pct")
     if hc_change is None or variance_pct is None:
@@ -444,39 +535,75 @@ def _validate_headcount_claim(text, evidence):
     material_hc_change = abs(hc_change) > headcount_band
     has_number = bool(_NUMBER_RE.search(text))
     generic_only = (not has_number) and (len(text.split()) <= 12)
+    direction = _parse_headcount_direction(text)
 
-    if not material_hc_change:
-        # No material headcount movement at all directly conflicts with a
-        # headcount-driven claim -- Checks 1/2/4 all pass (the claim is
-        # specific, checkable, and states a clear driver), so this is
-        # Contradicted, not Insufficient.
-        return Phase6Result(
-            CONTRADICTED, True, True, False, True, None, "Headcount Change", f"{hc_change:+.2f}",
-            f"The commentary attributes the movement to headcount, but the evidence package shows a "
-            f"headcount change of {hc_change:+.2f} for this department -- within the "
-            f"+/-{headcount_band} band treated as no material headcount driver.",
-        )
-
-    same_direction = (hc_change > 0 and variance_pct > 0) or (hc_change < 0 and variance_pct < 0)
-
-    if generic_only:
+    if direction == "unspecified":
+        # Route through the existing genericity check (Check 4), never
+        # through the old (removed) variance-direction default. A claim
+        # that is merely topically about headcount but asserts no
+        # discernible direction is exactly the "too generic to compare
+        # meaningfully" case Check 4 already exists to catch.
         return Phase6Result(
             INSUFFICIENT, True, True, None, False, 4, "Headcount Change", f"{hc_change:+.2f}",
-            "The claim is checkable and a material headcount change exists in the evidence, but the "
-            "commentary gives no scale, role, or timing detail -- too generic to compare meaningfully "
+            "The claim is checkable (headcount is a recognized driver type) and a headcount change exists "
+            "in the evidence, but the commentary does not assert a discernible direction (increase, "
+            "decrease, or no change) for that headcount movement -- too generic to compare meaningfully "
             "against the evidence.",
         )
 
-    if same_direction:
+    if generic_only and direction != "no_change":
+        # Preserve the pre-existing genericity behavior for very short,
+        # numberless claims -- a parsed direction doesn't by itself make a
+        # near-empty claim ("hired.") sufficiently specific. A "no_change"
+        # assertion is exempt: "no change" / "unchanged" is itself a
+        # complete, checkable claim regardless of length.
+        return Phase6Result(
+            INSUFFICIENT, True, True, None, False, 4, "Headcount Change", f"{hc_change:+.2f}",
+            "The claim is checkable and a headcount change exists in the evidence, but the commentary "
+            "gives no scale, role, or timing detail beyond a bare direction word -- too generic to "
+            "compare meaningfully against the evidence.",
+        )
+
+    if direction == "no_change":
+        if not material_hc_change:
+            return Phase6Result(
+                SUPPORTED, True, True, True, True, None, "Headcount Change", f"{hc_change:+.2f}",
+                f"The commentary claims no material change in headcount; the evidence package shows a "
+                f"headcount change of {hc_change:+.2f} for this department, within the +/-{headcount_band} "
+                f"band -- consistent with (not proof of) the claimed 'no change'.",
+            )
+        return Phase6Result(
+            CONTRADICTED, True, True, False, True, None, "Headcount Change", f"{hc_change:+.2f}",
+            f"The commentary claims no change in headcount, but the evidence package shows a headcount "
+            f"change of {hc_change:+.2f} for this department, outside the +/-{headcount_band} band -- "
+            f"directly contradicting the claim's own premise.",
+        )
+
+    # direction is "increase" or "decrease" from here on.
+    if not material_hc_change:
+        return Phase6Result(
+            CONTRADICTED, True, True, False, True, None, "Headcount Change", f"{hc_change:+.2f}",
+            f"MATERIALITY GATE: the commentary attributes the movement to a headcount {direction}, but "
+            f"the evidence package shows a headcount change of {hc_change:+.2f} for this department -- "
+            f"within the +/-{headcount_band} band treated as no material headcount driver, regardless of "
+            f"which direction was claimed.",
+        )
+
+    asserted_sign_positive = (direction == "increase")
+    actual_sign_positive = hc_change > 0
+    direction_matches = asserted_sign_positive == actual_sign_positive
+
+    if direction_matches:
         return Phase6Result(
             SUPPORTED, True, True, True, True, None, "Headcount Change", f"{hc_change:+.2f}",
-            f"Headcount changed {hc_change:+.2f} in the same direction as the variance "
-            f"({variance_pct:+.1%}) -- consistent with (not proof of) the claimed driver.",
+            f"Headcount changed {hc_change:+.2f}, matching the claimed {direction} -- consistent with "
+            f"(not proof of) the claimed driver.",
         )
     return Phase6Result(
         CONTRADICTED, True, True, False, True, None, "Headcount Change", f"{hc_change:+.2f}",
-        f"The commentary attributes the movement to headcount, but headcount moved {hc_change:+.2f} "
-        f"while the variance moved {variance_pct:+.1%} -- opposite directions.",
+        f"DIRECTION MISMATCH: the commentary attributes the movement to a headcount {direction}, but "
+        f"headcount actually moved {hc_change:+.2f} for this department -- the opposite of the claimed "
+        f"direction.",
     )
 
 
