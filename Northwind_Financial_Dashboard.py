@@ -712,7 +712,19 @@ with tab_close:
     if observation_register.empty:
         st.success("No observations this run — register is empty.")
     else:
-        st.dataframe(observation_register, use_container_width=True)
+        # Phase 7 period-display addendum (addendum to
+        # phase6_headcount_direction_fix_brief_v1.md): apply R.fmt_period_label
+        # at this render point, on a display-only copy. Under current
+        # canonical build_observation_register() behavior the register's
+        # Period field is already fmt_period_label() output, so this is a
+        # safe no-op today (fmt_period_label is documented idempotent on
+        # already-formatted strings) -- it hardens this render point against
+        # any future change to what the register stores, without changing
+        # today's displayed values. The underlying observation_register
+        # variable used for matching/keying below is never mutated.
+        _display_register = observation_register.copy()
+        _display_register["Period"] = _display_register["Period"].apply(R.fmt_period_label)
+        st.dataframe(_display_register, use_container_width=True)
 
     # -----------------------------------------------------------------------
     # Commentary Review — Phase 4 (Commentary Matching), Phase 5 (Finance
@@ -841,7 +853,10 @@ with tab_close:
         )
         if not open_uncommented.empty:
             st.info(f"{len(open_uncommented)} open observation(s) have no matching commentary yet.")
-            st.dataframe(open_uncommented, use_container_width=True)
+            # Same display-only formatting as the main register table above.
+            _display_open_uncommented = open_uncommented.copy()
+            _display_open_uncommented["Period"] = _display_open_uncommented["Period"].apply(R.fmt_period_label)
+            st.dataframe(_display_open_uncommented, use_container_width=True)
 
         for oid, record in commentary_records.items():
             obs_matches = observation_register[observation_register["Observation ID"] == oid]
@@ -851,7 +866,7 @@ with tab_close:
             latest = record.versions[-1]
             status_label = latest.validation_result.assessment if latest.validation_result else "unvalidated"
             with st.expander(
-                f"{obs_row['Department']} / {obs_row['Category']} ({obs_row['Period']}) — {status_label}",
+                f"{obs_row['Department']} / {obs_row['Category']} ({R.fmt_period_label(obs_row['Period'])}) — {status_label}",
                 expanded=(record.accepted_version_number is None),
             ):
                 st.markdown(
@@ -911,7 +926,9 @@ with tab_close:
                     st.success(f"Version {accept_choice} marked Accepted for this observation.")
                     st.rerun()
 
-        accepted_lines_preview = CWF.accepted_commentary_prompt_lines(commentary_records, observation_register)
+        accepted_lines_preview = CWF.accepted_commentary_prompt_lines(
+            commentary_records, observation_register, fmt_period_label=R.fmt_period_label
+        )
         if accepted_lines_preview:
             st.divider()
             st.caption("Accepted commentary that will flow into the executive narrative (Phase 7, Section G handoff):")
@@ -1048,10 +1065,17 @@ with tab_narr:
     # this session (see Commentary Review section above). Byte-identical to
     # pre-Phase-4-6 behavior whenever observation_register is empty,
     # regardless of commentary-file presence (Brief Section G, Criterion 1).
+    #
+    # Phase 7 period-display addendum (addendum to
+    # phase6_headcount_direction_fix_brief_v1.md): this tab's narrative/
+    # prompt text is CFO/Board-facing (IA #9) and must use the same D14
+    # display-format convention as every other user-facing surface. Reuses
+    # the existing R.fmt_period_label formatter -- no second implementation.
     _commentary_block = CWF.build_narrative_commentary_section(
         observation_register,
         st.session_state.get("commentary_records", {}),
         st.session_state.get("commentary_file_supplied", False),
+        fmt_period_label=R.fmt_period_label,
     )
     user_prompt = R.build_user_prompt(
         period_col, period_order, current_period, prior_period, prior_period,

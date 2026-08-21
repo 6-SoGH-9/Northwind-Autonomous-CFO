@@ -184,6 +184,50 @@ def build_observation_register(phase2_result, phase3_result, fmt_period_label, c
             })
     if phase3_result.status == cv_status_ok:
         for _, r in phase3_result.flagged_rows.iterrows():
+            # Period representation (investigated per builder_task_final,
+            # "Observation Register Period Semantics" independent
+            # investigation): this line intentionally applies
+            # fmt_period_label() to the raw "Fiscal Quarter" value BEFORE
+            # storing it as this register's canonical "Period" field and
+            # passing it into make_observation_id().
+            #
+            # This is CORRECT, not a defect, and must not be "fixed" to
+            # store the raw value instead without a fresh investigation
+            # reaching a different evidence-based conclusion than the one
+            # already on record. Evidence (see build_test/
+            # period_semantics_investigation.py and the governing Return
+            # Report):
+            #   1. The source dataset (Northwind_Sample_Dataset.xlsx)
+            #      contains no "Fiscal Quarter" value at all -- only
+            #      monthly Date columns. "Fiscal Quarter" and its "Q# FY####"
+            #      shape are entirely derived (rollups.py's add_fiscal_cols),
+            #      not a source-of-truth format.
+            #   2. project_handbook.md's D14 close-out (Verified) already
+            #      settled the product-wide convention: rendered labels are
+            #      "Q4 2026", not "Q4 FY2026" -- this line's use of
+            #      fmt_period_label() keeps the register consistent with
+            #      that already-settled, Verified convention.
+            #   3. _find_period_terms() (below) is a plain, format-agnostic
+            #      substring matcher -- it matches whatever the register's
+            #      own Period column currently contains, whatever format
+            #      that is. Commentary written in the D14 display
+            #      convention ("Q2 2025") matches correctly against this
+            #      register today; commentary written in the older, raw
+            #      "Q# FY####" convention does not, and correctly falls
+            #      back to "ambiguous, no period reference to disambiguate"
+            #      rather than a silent wrong match.
+            #   4. A prior, informal, unpromoted local change that stored
+            #      the raw Fiscal Quarter value instead was found, on
+            #      independent re-investigation, to have been based on an
+            #      incorrect premise (assuming commentary using the OLDER
+            #      "FY"-inclusive wording was the thing that needed to
+            #      match, rather than recognizing that wording predates
+            #      the settled D14 convention). That change is NOT applied
+            #      here. If commentary text still uses the older
+            #      "Q# FY####" wording, the correct fix is to update that
+            #      commentary text to the current convention -- not to
+            #      move this register away from a Verified, product-wide
+            #      display standard.
             period_label = fmt_period_label(r["Fiscal Quarter"])
             obs_id = make_observation_id("Phase 3", period_label, r["Department"], r["Category"])
             rows.append({
@@ -896,13 +940,22 @@ def serialize_commentary_records(records_by_observation_id):
 # ---------------------------------------------------------------------------
 # Section G — Executive-output handoff
 # ---------------------------------------------------------------------------
-def accepted_commentary_prompt_lines(records_by_observation_id, observation_register):
+def accepted_commentary_prompt_lines(records_by_observation_id, observation_register, fmt_period_label=None):
     """v4-era helper, unchanged behavior, still used by the dashboard's own
     'accepted commentary preview' panel (Section E display only). Phase 7
     reads ONLY the text of the version marked accepted_version_number --
     never an unaccepted, superseded, or AI-generated substitute (Brief
     Section G). Returns formatted lines, each traceable to a specific
     accepted commentary version.
+
+    fmt_period_label: optional display formatter (e.g. R.fmt_period_label),
+    added by the Phase 7 period-display addendum (addendum to
+    phase6_headcount_direction_fix_brief_v1.md). Called from two places:
+    the dashboard's own display-only preview panel, and
+    build_narrative_commentary_section() (Phase 7's Section G handoff,
+    CFO/Board-facing per IA #9). Both now pass a formatter. Defaults to no
+    formatting (identity) when omitted, so any caller that predates this
+    parameter keeps its exact pre-existing behavior.
 
     NOT used directly for the narrative prompt as of v5 -- see
     build_narrative_commentary_section() below, which wraps this same
@@ -916,8 +969,9 @@ def accepted_commentary_prompt_lines(records_by_observation_id, observation_regi
         if obs_rows.empty:
             continue
         obs = obs_rows.iloc[0]
+        display_period = fmt_period_label(obs["Period"]) if fmt_period_label else obs["Period"]
         lines.append(
-            f"  - {obs['Department']} / {obs['Category']} ({obs['Period']}, {obs['Type']}): "
+            f"  - {obs['Department']} / {obs['Category']} ({display_period}, {obs['Type']}): "
             f"{text} [accepted version {rec.accepted_version_number}]"
         )
     return lines
@@ -926,14 +980,40 @@ def accepted_commentary_prompt_lines(records_by_observation_id, observation_regi
 # ---------------------------------------------------------------------------
 # Section G — Executive-output handoff, THREE-WAY (Brief v5, rewritten)
 # ---------------------------------------------------------------------------
-def _obs_label(obs_row):
-    return f"{obs_row['Department']} / {obs_row['Category']} ({obs_row['Period']}, {obs_row['Type']})"
+def _obs_label(obs_row, fmt_period_label=None):
+    display_period = fmt_period_label(obs_row["Period"]) if fmt_period_label else obs_row["Period"]
+    return f"{obs_row['Department']} / {obs_row['Category']} ({display_period}, {obs_row['Type']})"
 
 
-def build_narrative_commentary_section(observation_register, records_by_observation_id, commentary_file_supplied):
+def build_narrative_commentary_section(
+    observation_register, records_by_observation_id, commentary_file_supplied, fmt_period_label=None
+):
     """Brief v5, Section G. Determines which of the three required states
     applies and returns a single formatted block ready to insert into
     rollups.build_user_prompt()'s prompt (empty string if nothing to add).
+
+    fmt_period_label: display formatter (e.g. R.fmt_period_label), added by
+    the Phase 7 period-display addendum (addendum to
+    phase6_headcount_direction_fix_brief_v1.md). Phase 7's narrative/prompt
+    text is CFO/Board-facing (IA #9) and must use the same D14 display
+    convention as every other user-facing surface (e.g. "Q3 2026"), so this
+    function threads the formatter through to every place it renders a
+    period into text: the Case 2 "unresolved" lines, the Case 3
+    "unexplained" lines (both via _obs_label() above), and the Case 2
+    "accepted" lines (via accepted_commentary_prompt_lines(), which already
+    supports this same optional-formatter pattern). Defaults to no
+    formatting (identity) when omitted, so any caller that doesn't pass
+    this argument keeps this function's pre-addendum behavior exactly.
+    Note: under current canonical build_observation_register() behavior,
+    observation_register['Period'] is ALREADY the fmt_period_label()
+    output (see that function's Phase 3 branch) — fmt_period_label() is
+    documented idempotent on already-formatted strings (returns unchanged
+    if the input doesn't match the raw "Q# FY####" shape), so applying it
+    again here is a safe no-op today and only becomes load-bearing if the
+    register's storage format ever changes upstream. This keeps the
+    "apply display formatting only at the point of rendering to a user"
+    principle honored at this call site regardless of what the register
+    currently stores.
 
     Three states, in order, first match wins:
 
@@ -967,7 +1047,7 @@ def build_narrative_commentary_section(observation_register, records_by_observat
     # Case 3 — flags exist, no commentary file was ever supplied this close.
     if not commentary_file_supplied:
         lines = [
-            f"  - {_obs_label(obs)}: identified by Phase 2/3 validation; no Controller commentary "
+            f"  - {_obs_label(obs, fmt_period_label)}: identified by Phase 2/3 validation; no Controller commentary "
             f"was supplied for this close; UNEXPLAINED (no commentary process occurred for this item)."
             for _, obs in observation_register.iterrows()
         ]
@@ -980,7 +1060,7 @@ def build_narrative_commentary_section(observation_register, records_by_observat
         )
 
     # Case 2 — flags exist, a commentary file WAS supplied this close.
-    accepted_lines = accepted_commentary_prompt_lines(records_by_observation_id, observation_register)
+    accepted_lines = accepted_commentary_prompt_lines(records_by_observation_id, observation_register, fmt_period_label)
     unresolved_lines = []
     for _, obs in observation_register.iterrows():
         oid = obs["Observation ID"]
@@ -988,7 +1068,7 @@ def build_narrative_commentary_section(observation_register, records_by_observat
         if rec is not None and rec.accepted_text() is not None:
             continue  # already covered by accepted_lines
         unresolved_lines.append(
-            f"  - {_obs_label(obs)}: identified by Phase 2/3 validation; a commentary process was "
+            f"  - {_obs_label(obs, fmt_period_label)}: identified by Phase 2/3 validation; a commentary process was "
             f"attempted for this close but no accepted explanation currently exists; UNRESOLVED "
             f"(commentary process incomplete, not absent)."
         )
