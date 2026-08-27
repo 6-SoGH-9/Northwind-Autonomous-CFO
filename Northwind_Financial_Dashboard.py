@@ -791,6 +791,16 @@ with tab_close:
         )
         return CWF.validate_commentary(text, evidence)
 
+    # Brief v2 (phase4_semantic_reconciliation_brief_v2.md) Section 5a /
+    # Criterion 10a: a set of commentary_id values already attempted for
+    # semantic reconciliation THIS session (matched, or already tried and
+    # failed). Backed by st.session_state so a Streamlit rerun -- which
+    # re-executes this whole script -- never triggers a second semantic
+    # call for the same commentary just because the script reran.
+    if "semantic_reconciliation_attempted" not in st.session_state:
+        st.session_state["semantic_reconciliation_attempted"] = set()
+    semantic_attempted = st.session_state["semantic_reconciliation_attempted"]
+
     uploaded = st.file_uploader("Commentary.xlsx (optional)", type=["xlsx"], key="commentary_uploader")
     if uploaded is not None:
         st.session_state["commentary_file_supplied"] = True
@@ -803,7 +813,12 @@ with tab_close:
         if commentary_entries and observation_register.empty:
             st.info("Commentary file imported, but there are no open observations this period to match against.")
         elif commentary_entries:
-            match_results = CWF.match_commentary_entries(commentary_entries, observation_register)
+            # Brief v2 Sections 1-3: deterministic pass -> exclusivity ->
+            # gated semantic reconciliation, all in one pipeline call.
+            match_results = CWF.resolve_commentary_matches(
+                commentary_entries, observation_register, commentary_records,
+                semantic_attempted=semantic_attempted,
+            )
             unmatched = [m for m in match_results if not m.matched]
 
             for m in match_results:
@@ -829,19 +844,39 @@ with tab_close:
                 for m in unmatched:
                     with st.expander(f"Unmatched: {m.commentary_id}"):
                         st.write(m.text)
-                        st.caption(CWF.draft_finance_note(no_match_reason=m.match_basis))
+                        if m.match_basis.startswith(CWF.OCCUPIED_BASIS_PREFIX):
+                            st.info(m.match_basis)
+                        else:
+                            st.caption(CWF.draft_finance_note(no_match_reason=m.match_basis))
+                        # Exclusivity (Brief v2 Section 2): an already-
+                        # occupied observation is never offered as a manual
+                        # target either -- the manual path is the same
+                        # "point where a match is about to be recorded" the
+                        # Brief names, so it must enforce the same rule as
+                        # the automated paths.
+                        _occupied_ids = {o for o, rec in commentary_records.items() if rec.versions}
+                        _available_obs = [
+                            o for o in observation_register["Observation ID"].tolist()
+                            if o not in _occupied_ids
+                        ]
                         manual_obs = st.selectbox(
-                            "Manually associate with observation",
-                            ["(select)"] + observation_register["Observation ID"].tolist(),
+                            "Manually associate with observation (already-commented observations are not offered)",
+                            ["(select)"] + _available_obs,
                             key=f"manual_{m.commentary_id}",
                         )
                         if manual_obs != "(select)" and st.button("Confirm manual match", key=f"confirm_{m.commentary_id}"):
-                            record = commentary_records.get(manual_obs) or CWF.CommentaryRecord(observation_id=manual_obs)
-                            obs_row = observation_register[observation_register["Observation ID"] == manual_obs].iloc[0]
-                            result = _validate_new_text(m.text, obs_row)
-                            record.add_version(m.text, CWF.SOURCE_ORIGINAL_IMPORT, "controller_import", result)
-                            commentary_records[manual_obs] = record
-                            st.rerun()
+                            if manual_obs in _occupied_ids:
+                                st.error(
+                                    "This observation already has a commentary — consolidate into the "
+                                    "existing entry instead of creating a second one."
+                                )
+                            else:
+                                record = commentary_records.get(manual_obs) or CWF.CommentaryRecord(observation_id=manual_obs)
+                                obs_row = observation_register[observation_register["Observation ID"] == manual_obs].iloc[0]
+                                result = _validate_new_text(m.text, obs_row)
+                                record.add_version(m.text, CWF.SOURCE_ORIGINAL_IMPORT, "controller_import", result)
+                                commentary_records[manual_obs] = record
+                                st.rerun()
 
     if not commentary_records:
         st.caption("No commentary imported yet this session.")

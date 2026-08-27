@@ -244,7 +244,10 @@ def build_observation_register(phase2_result, phase3_result, fmt_period_label, c
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 — Commentary Matching (Section B)
+# Phase 4 — Commentary Matching (Section B; deterministic-pass corrections
+# and Value signal added by phase4_semantic_reconciliation_brief_v2.md
+# Section 1; exclusivity added Section 2; semantic reconciliation added
+# Section 3, all below)
 # ---------------------------------------------------------------------------
 @dataclass
 class MatchResult:
@@ -253,6 +256,13 @@ class MatchResult:
     matched_observation_id: Optional[str]
     matched: bool
     match_basis: str
+    # Added Brief v2 -- which resolution path produced this result:
+    # "deterministic" | "semantic" | "unresolved". Defaulted so every
+    # existing positional/keyword construction site (all inside this
+    # module) and every external reader (build_test/commentary_workflow_
+    # demo.py, the dashboard) that only reads matched/matched_observation_id/
+    # match_basis by name keeps working unmodified.
+    method: str = "deterministic"
 
 
 # Generic synonym/abbreviation vocabulary for THIS dataset's fixed
@@ -308,18 +318,94 @@ def _find_period_terms(text, period_labels):
     return {label for label in period_labels if label and label.lower() in lower}
 
 
+# Recognizes a single stated monetary figure, e.g. "$45,000", "$45,000.00",
+# "-$12,000". Deliberately conservative (Brief v2 Section 1: "Builder's
+# implementation discretion on parsing, not on whether the check happens") --
+# this does not attempt to parse "forty five thousand dollars" or bare
+# numbers with no "$", since an unmarked number is too likely to be
+# something else (a date, a headcount, a percentage) to treat as a stated
+# financial value.
+_VALUE_PATTERN = re.compile(r"(-)?\$\s?([\d,]+(?:\.\d+)?)")
+
+
+def _parse_stated_value(text):
+    """Return the first $-marked figure in `text` as a float, or None if no
+    such figure is present. Sign is taken from a leading '-' immediately
+    before the '$' (e.g. '-$12,000'); dollar amounts are otherwise
+    magnitude-only, since commentary text describes both increases and
+    decreases in plain language ('fell by $12,000') rather than always
+    signing the figure itself -- magnitude comparison against the
+    observation's Delta/Before/After is handled in `_value_consistent`."""
+    m = _VALUE_PATTERN.search(text)
+    if not m:
+        return None
+    digits = m.group(2).replace(",", "")
+    if not digits:
+        return None
+    try:
+        value = float(digits)
+    except ValueError:
+        return None
+    return -value if m.group(1) else value
+
+
+def _value_consistent(stated_value, obs_row, tolerance=1.0):
+    """Brief v2 Section 1, "Value as a matching signal". Compares the
+    commentary's stated figure against whichever of the candidate
+    observation's Delta ($) / Before ($) / After ($) it most plausibly
+    refers to.
+
+    Returns:
+      - None  if stated_value is None (no figure was stated -- no
+        comparison possible, and the caller must not treat this as either
+        support or conflict).
+      - True  if stated_value's magnitude is within `tolerance` of at least
+        one of Delta/Before/After's magnitude.
+      - False if a figure was stated and it matches none of the three --
+        this is "evidence against th[e] match, not proof of a different
+        one" (Brief v2 Section 1); the caller decides what to do with it.
+
+    Magnitude-only comparison (abs() on both sides): commentary states
+    figures in plain language ("costs rose by $50,000") without necessarily
+    matching this dataset's Delta ($) sign convention, so a magnitude match
+    is the correct check here -- direction is not part of what Section 1
+    asks this signal to verify.
+    """
+    if stated_value is None:
+        return None
+    candidates = []
+    for field_name in ("Delta ($)", "Before ($)", "After ($)"):
+        v = obs_row.get(field_name)
+        if v is not None and pd.notna(v):
+            candidates.append(v)
+    if not candidates:
+        return None
+    return any(abs(abs(stated_value) - abs(c)) <= tolerance for c in candidates)
+
+
 def match_commentary_entries(entries, observation_register):
-    """Phase 4. For each CommentaryEntry, resolve the single best-supported
-    observation, or return 'no confident match' (Acceptance Criteria B.1-4).
+    """Phase 4 — deterministic pass (Brief v2 Section 1). For each
+    CommentaryEntry, resolve the single best-supported observation, or
+    return 'no confident match'.
 
     Scoring is deliberately conservative: a match requires an unambiguous
     Department reference AND an unambiguous Category reference (explicit
     name or known synonym). Department or Category alone is never
     sufficient — a forced match with weak support is a defect, not a
-    feature (Brief Section B). Period reference, when present, disambiguates
-    among multiple open observations sharing the same Department/Category;
-    when absent, a match is only made if exactly one open observation exists
-    for that Department/Category pair.
+    feature. A stated Value, when present, is checked against the
+    candidate's Delta/Before/After (Section 1) -- a conflicting value falls
+    through to no confident match rather than being silently ignored.
+
+    Period handling (Section 1, corrected defect): when the commentary
+    explicitly states a period, the candidate set is ALWAYS narrowed to that
+    period -- including to zero -- never left as an unnarrowed, wrong-period
+    candidate. A stated period matching none of the Department/Category
+    candidates is therefore no confident match, full stop.
+
+    This function performs ONLY the deterministic pass. Exclusivity
+    (Section 2) and gated semantic reconciliation (Section 3) are applied
+    afterward by resolve_commentary_matches(), which wraps this function --
+    call that, not this one, for the full Phase 4 pipeline.
     """
     if observation_register.empty:
         departments, categories, periods = [], [], []
@@ -333,6 +419,7 @@ def match_commentary_entries(entries, observation_register):
         dept_hits = _find_canonical_terms(entry.text, DEPARTMENT_SYNONYMS, departments)
         cat_hits = _find_canonical_terms(entry.text, CATEGORY_SYNONYMS, categories)
         period_hits = _find_period_terms(entry.text, periods)
+        stated_value = _parse_stated_value(entry.text)
 
         if not dept_hits or not cat_hits or len(dept_hits) > 1 or len(cat_hits) > 1:
             reason = ("no department/category reference found" if not (dept_hits or cat_hits)
@@ -345,27 +432,275 @@ def match_commentary_entries(entries, observation_register):
             (observation_register["Department"] == dept) & (observation_register["Category"] == cat)
         ]
         if period_hits:
-            narrowed = candidates[candidates["Period"].isin(period_hits)]
-            if not narrowed.empty:
-                candidates = narrowed
+            # CORRECTED DEFECT (Brief v2 Section 1): always narrow, even to
+            # empty -- never fall back to an unnarrowed, wrong-period
+            # candidate just because narrowing produced zero rows.
+            candidates = candidates[candidates["Period"].isin(period_hits)]
 
         if len(candidates) == 0:
+            period_clause = f", Period in {sorted(period_hits)}" if period_hits else ""
             results.append(MatchResult(
                 entry.commentary_id, entry.text, None, False,
-                f"referenced {dept} / {cat} but no open observation exists for that combination",
+                f"referenced {dept} / {cat}{period_clause} but no open observation exists for that combination",
             ))
         elif len(candidates) == 1:
+            obs_row = candidates.iloc[0]
+            value_check = _value_consistent(stated_value, obs_row)
+            if value_check is False:
+                results.append(MatchResult(
+                    entry.commentary_id, entry.text, None, False,
+                    f"referenced {dept} / {cat} but stated value (${stated_value:,.2f}) does not match this "
+                    f"observation's Delta/Before/After (${obs_row['Delta ($)']:,.2f} / ${obs_row['Before ($)']:,.2f} "
+                    f"/ ${obs_row['After ($)']:,.2f}) — no confident match",
+                ))
+                continue
             basis = f"matched on Department={dept}, Category={cat}"
             basis += f", Period in {sorted(period_hits)}" if period_hits else " (single open observation for this Department/Category)"
+            if value_check is True:
+                basis += f", Value ${stated_value:,.2f} consistent"
             results.append(MatchResult(
-                entry.commentary_id, entry.text, candidates.iloc[0]["Observation ID"], True, basis,
+                entry.commentary_id, entry.text, obs_row["Observation ID"], True, basis,
             ))
         else:
+            # Multiple candidates remain after Department/Category(/Period)
+            # narrowing. A stated Value may still disambiguate them (Section
+            # 1: Value is a matching signal, not limited to the
+            # single-candidate case) -- but only if it points to EXACTLY one
+            # of the remaining candidates; anything else stays ambiguous.
+            if stated_value is not None:
+                value_hits = [
+                    idx for idx, row in candidates.iterrows()
+                    if _value_consistent(stated_value, row) is True
+                ]
+                if len(value_hits) == 1:
+                    obs_row = candidates.loc[value_hits[0]]
+                    results.append(MatchResult(
+                        entry.commentary_id, entry.text, obs_row["Observation ID"], True,
+                        f"matched on Department={dept}, Category={cat}, disambiguated by stated Value "
+                        f"(${stated_value:,.2f} consistent with only one of {len(candidates)} candidates)",
+                    ))
+                    continue
             results.append(MatchResult(
                 entry.commentary_id, entry.text, None, False,
                 f"{dept} / {cat} matches {len(candidates)} open observations across different periods; "
-                "no period reference in the commentary to disambiguate",
+                "no period reference (or stated Value) in the commentary to disambiguate",
             ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 v2 — Exclusivity (Brief v2 Section 2) and gated semantic
+# reconciliation (Sections 3-5, 5a)
+# ---------------------------------------------------------------------------
+OCCUPIED_BASIS_PREFIX = "observation already has a commentary — consolidate into the existing entry"
+
+# Section 4: the semantic layer's ENTIRE job is "which of these candidates,
+# if any, does this commentary mean" -- no financial calculation, no
+# evidence validation, no fact invention. The system prompt states this
+# boundary directly so it's enforced at the request level, not only in
+# Builder's post-hoc validation of the response.
+SEMANTIC_RECONCILIATION_SYSTEM_PROMPT = """You are assisting a financial close review. You will be given a list of currently-unmatched financial observations and a piece of Controller commentary. Your ONLY job is to decide whether the commentary's meaning refers to exactly one of the listed observations.
+
+Rules:
+- You may select an observation ONLY by its exact Observation ID from the list provided. Never invent an ID.
+- If the commentary does not clearly and confidently refer to exactly one observation in the list, respond NO_MATCH. On ambiguity between two or more candidates, respond NO_MATCH.
+- Do not perform financial calculation. Do not judge whether the commentary is a correct or supported explanation. Do not invent facts, causes, or figures. Your only task is identifying which observation (if any) the commentary is ABOUT.
+- Respond with EXACTLY one line and nothing else: either the Observation ID, or the literal text NO_MATCH."""
+
+
+def _build_semantic_prompt(entry_text, candidate_observations):
+    lines = ["Currently-unmatched candidate observations:"]
+    for _, row in candidate_observations.iterrows():
+        lines.append(
+            f"- {row['Observation ID']}: {row['Department']} / {row['Category']}, "
+            f"{row['Period']}, Delta ${row['Delta ($)']:,.2f} "
+            f"(${row['Before ($)']:,.2f} -> ${row['After ($)']:,.2f})"
+        )
+    lines.append("")
+    lines.append('Controller commentary:\n"""')
+    lines.append(entry_text)
+    lines.append('"""')
+    lines.append("")
+    lines.append("Which candidate Observation ID (if any) does this commentary refer to?")
+    return "\n".join(lines)
+
+
+def semantic_reconcile_commentary(entry_text, candidate_observations, model="claude-sonnet-4-6", max_tokens=50):
+    """Semantic reconciliation, Brief v2 Sections 3-5. Pure function: given
+    one unresolved commentary's text and the DataFrame of currently-
+    unmatched/unoccupied observations, returns (matched_observation_id, None)
+    on a confident, validated match, or (None, reason) in every other case
+    -- never raises. Mirrors rollups.call_claude_narrative()'s exact
+    failure-mode shape (Section 5's "return a tuple, never raise" pattern).
+
+    Failure modes, all neutral (Section 5):
+      - No ANTHROPIC_API_KEY -> (None, reason), no exception, no forced
+        match, no call attempted.
+      - No candidates supplied -> (None, reason), no call attempted (this
+        is the Section 3 condition-2 gate; also enforced by the caller,
+        resolve_commentary_matches, but checked again here defensively).
+      - API/network failure -> (None, reason), no retry (Section 5a).
+      - Model response is not exactly "NO_MATCH" or a real member of
+        candidate_observations' actual Observation ID set -> treated as no
+        confident match (Section 4: "never trust a returned observation ID
+        without checking it against real data"; Criterion 7).
+
+    This function makes NO gating decision (Section 3's two-condition
+    invocation gate is the caller's responsibility, in
+    resolve_commentary_matches) and NO idempotency decision (Section 5a's
+    rerun-deduplication is also the caller's responsibility) -- it is the
+    gated action itself, always calling the API when invoked with a key
+    present and a non-empty candidate set. Injected as `semantic_fn` in
+    resolve_commentary_matches for testing without a real API call.
+    """
+    import os
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, "No ANTHROPIC_API_KEY found in environment — semantic reconciliation unavailable this session."
+    if candidate_observations is None or candidate_observations.empty:
+        return None, "No unmatched observations remain — semantic reconciliation not invoked."
+
+    valid_ids = set(candidate_observations["Observation ID"])
+    prompt = _build_semantic_prompt(entry_text, candidate_observations)
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            system=SEMANTIC_RECONCILIATION_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(block.text for block in resp.content if block.type == "text").strip()
+    except Exception as e:
+        return None, f"API call failed: {e}"
+
+    candidate_id = raw.splitlines()[0].strip() if raw else ""
+    if candidate_id == "NO_MATCH":
+        return None, "Semantic reconciliation found no confident match."
+    if candidate_id in valid_ids:
+        return candidate_id, None
+    # Malformed, out-of-set, or otherwise unusable -- never trusted at face
+    # value (Section 4 / Criterion 7).
+    return None, f"Semantic reconciliation returned an unusable/invalid response ({raw[:120]!r}); treated as no confident match."
+
+
+def resolve_commentary_matches(entries, observation_register, commentary_records, semantic_attempted=None, semantic_fn=None):
+    """Full Phase 4 resolution pipeline (Brief v2): deterministic pass
+    (Section 1, match_commentary_entries) -> exclusivity enforcement
+    (Section 2) -> gated semantic reconciliation (Section 3). This is the
+    function callers (the dashboard) should use for the complete pipeline;
+    match_commentary_entries() alone only covers Section 1.
+
+    entries: list[CommentaryEntry] to resolve this call.
+    observation_register: the current full observation register (as built
+      by build_observation_register()).
+    commentary_records: dict[observation_id -> CommentaryRecord] --
+      TODAY's actual state, read but not mutated by this function (the
+      caller decides how/when to call record.add_version(), same as
+      before). An observation_id present here with >=1 version is
+      OCCUPIED (Section 2) and is excluded from BOTH deterministic
+      acceptance and the semantic candidate set.
+    semantic_attempted: optional mutable set[str] of commentary_id values
+      already attempted this session (matched, or already tried and
+      failed) -- the caller (dashboard) should back this with
+      st.session_state so a Streamlit rerun does not re-invoke the API for
+      the same commentary twice (Section 5a / Criterion 10a). A fresh set
+      is used if omitted -- correct for a one-shot call, not sufficient for
+      a caller that re-invokes this function every rerun without
+      persisting the set itself.
+    semantic_fn: injectable for testing (defaults to
+      semantic_reconcile_commentary); must return (id_or_None, reason_or_None).
+
+    Returns list[MatchResult], one per input entry, each carrying `method`
+    in {"deterministic", "semantic", "unresolved"}.
+    """
+    if semantic_attempted is None:
+        semantic_attempted = set()
+    if semantic_fn is None:
+        semantic_fn = semantic_reconcile_commentary
+
+    def _occupied(oid):
+        rec = commentary_records.get(oid)
+        return bool(rec and rec.versions)
+
+    deterministic = match_commentary_entries(entries, observation_register)
+
+    results = []
+    unresolved = []  # list of MatchResult still needing the semantic gate
+    claimed_this_batch = set()  # observation IDs already attached EARLIER in
+    # this same call's entries list -- needed because match_commentary_
+    # entries() resolves every entry independently and has no knowledge of
+    # exclusivity, so two entries in one batch can both deterministically
+    # resolve to the same still-unoccupied observation. Processed in input
+    # order: the first claims it, later ones are treated exactly like an
+    # externally-occupied conflict (Criterion 3: "the first is attached; the
+    # second is reported unresolved/occupied, never silently added as a
+    # second version").
+    for m in deterministic:
+        m.method = "deterministic"
+        if m.matched and (_occupied(m.matched_observation_id) or m.matched_observation_id in claimed_this_batch):
+            if m.matched_observation_id in claimed_this_batch and not _occupied(m.matched_observation_id):
+                conflict_note = "already claimed by an earlier entry in this same import batch"
+            else:
+                conflict_note = f"deterministic candidate occupied: {m.match_basis}"
+            m.match_basis = f"{OCCUPIED_BASIS_PREFIX} ({conflict_note})"
+            m.matched = False
+            m.matched_observation_id = None
+            unresolved.append(m)
+        elif m.matched:
+            claimed_this_batch.add(m.matched_observation_id)
+            results.append(m)
+        else:
+            unresolved.append(m)
+
+    for m in unresolved:
+        was_occupied_conflict = m.match_basis.startswith(OCCUPIED_BASIS_PREFIX)
+
+        occupied_ids = {oid for oid, rec in commentary_records.items() if rec.versions}
+        # Also exclude observations already claimed earlier IN THIS SAME
+        # batch (deterministic matches processed above), so two entries in
+        # one import batch can't both deterministically or semantically
+        # claim the same observation before commentary_records itself is
+        # updated by the caller.
+        occupied_ids |= {r.matched_observation_id for r in results if r.matched}
+        unmatched_obs = (
+            observation_register[~observation_register["Observation ID"].isin(occupied_ids)]
+            if not observation_register.empty else observation_register
+        )
+
+        if unmatched_obs.empty:
+            # Section 3 condition 2 fails: gate closed, zero semantic calls.
+            if not was_occupied_conflict:
+                m.match_basis += " (no unmatched observations remain — semantic reconciliation not invoked)"
+            m.method = "unresolved"
+            results.append(m)
+            continue
+
+        if m.commentary_id in semantic_attempted:
+            # Section 5a / Criterion 10a: already attempted this session --
+            # a rerun must not call again.
+            m.match_basis = (
+                m.match_basis if was_occupied_conflict
+                else "semantic reconciliation already attempted this session — not called again"
+            )
+            m.method = "unresolved"
+            results.append(m)
+            continue
+
+        semantic_attempted.add(m.commentary_id)
+        matched_oid, reason = semantic_fn(m.text, unmatched_obs)
+        if matched_oid:
+            m.matched = True
+            m.matched_observation_id = matched_oid
+            m.match_basis = "semantic reconciliation: confident match, validated against current unmatched set"
+            m.method = "semantic"
+        else:
+            m.match_basis = reason or "semantic reconciliation: no confident match"
+            m.method = "unresolved"
+        results.append(m)
+
     return results
 
 
