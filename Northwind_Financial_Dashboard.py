@@ -724,7 +724,7 @@ with tab_close:
         # variable used for matching/keying below is never mutated.
         _display_register = observation_register.copy()
         _display_register["Period"] = _display_register["Period"].apply(R.fmt_period_label)
-        st.dataframe(_display_register, use_container_width=True)
+        st.dataframe(fmt_display_df(_display_register), use_container_width=True)
 
     # -----------------------------------------------------------------------
     # Commentary Review — Phase 4 (Commentary Matching), Phase 5 (Finance
