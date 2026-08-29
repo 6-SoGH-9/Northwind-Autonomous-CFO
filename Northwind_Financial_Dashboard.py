@@ -832,6 +832,11 @@ with tab_close:
                 if not any(v.source == CWF.SOURCE_ORIGINAL_IMPORT and v.text == m.text for v in record.versions):
                     obs_row = observation_register[observation_register["Observation ID"] == oid].iloc[0]
                     result = _validate_new_text(m.text, obs_row)
+                    # Audit-trail addendum: record how this commentary was
+                    # resolved ("deterministic" or "semantic"), set once at
+                    # attachment time, before the first add_version() call.
+                    record.match_method = m.method
+                    record.match_basis = m.match_basis
                     record.add_version(m.text, CWF.SOURCE_ORIGINAL_IMPORT, "controller_import", result)
                 commentary_records[oid] = record
 
@@ -874,6 +879,10 @@ with tab_close:
                                 record = commentary_records.get(manual_obs) or CWF.CommentaryRecord(observation_id=manual_obs)
                                 obs_row = observation_register[observation_register["Observation ID"] == manual_obs].iloc[0]
                                 result = _validate_new_text(m.text, obs_row)
+                                # Audit-trail addendum: manual reconciliation
+                                # gets its own explicit method label.
+                                record.match_method = "manual"
+                                record.match_basis = "manually reconciled via Commentary Review"
                                 record.add_version(m.text, CWF.SOURCE_ORIGINAL_IMPORT, "controller_import", result)
                                 commentary_records[manual_obs] = record
                                 st.rerun()
@@ -911,6 +920,8 @@ with tab_close:
                 )
                 st.markdown(f"**Current commentary — version {latest.version_number} ({latest.source}):**")
                 st.write(latest.text)
+                if record.match_method:
+                    st.caption(f"Matched via: {record.match_method}")
 
                 if latest.validation_result is not None:
                     vr = latest.validation_result

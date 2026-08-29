@@ -1201,6 +1201,17 @@ class CommentaryRecord:
     observation_id: str
     versions: List[CommentaryVersion] = field(default_factory=list)
     accepted_version_number: Optional[int] = None
+    # Added by the audit-trail addendum to phase4_semantic_reconciliation_
+    # brief_v2.md. Set ONCE, at the point a record is first created for an
+    # observation (i.e. when a commentary is first attached) -- not on every
+    # add_version() call. "deterministic" | "semantic" | "manual" | None
+    # (None only if a record somehow exists with zero versions, which
+    # normal flow never produces). match_basis is a short human-readable
+    # reason. Deliberately NOT threaded into add_version()'s signature --
+    # every existing call site, including inside the regression fixtures,
+    # is unaffected.
+    match_method: Optional[str] = None
+    match_basis: Optional[str] = None
 
     def add_version(self, text, source, submitted_by, validation_result):
         """Each revision is a new, complete version -- never a patch applied
@@ -1251,6 +1262,8 @@ class CommentaryRecord:
         return {
             "observation_id": self.observation_id,
             "accepted_version_number": self.accepted_version_number,
+            "match_method": self.match_method,
+            "match_basis": self.match_basis,
             "versions": [
                 {
                     "version_number": v.version_number, "text": v.text, "source": v.source,
