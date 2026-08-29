@@ -468,6 +468,71 @@ check("Criterion 10c: suppression is per-commentary-id -- a NEW entry (C10b) int
       f"call_log={log_rerun2}")
 
 # ===========================================================================
+# Audit-trail addendum checks (builder_brief_audit_trail_narrative_sync.md,
+# Section 5) -- match_method/match_basis on CommentaryRecord, set once at
+# attachment time, for all three resolution paths, plus a round-trip check.
+# These mirror the exact call pattern the dashboard uses at each of its
+# three edit points (Section 2.2), not a new abstraction.
+# ===========================================================================
+
+# New check 1 -- deterministic match.
+c_audit_det = CW.CommentaryEntry(commentary_id="C-AUDIT-DET",
+                                  text="G&A Salaries & Benefits rose by $40,000 in Q2 2026 due to merit increases.")
+stub_audit_det, _ = counting_semantic_stub()
+r_audit_det = CW.resolve_commentary_matches([c_audit_det], observation_register, {}, semantic_fn=stub_audit_det)[0]
+rec_audit_det = CW.CommentaryRecord(observation_id=r_audit_det.matched_observation_id)
+rec_audit_det.match_method = r_audit_det.method
+rec_audit_det.match_basis = r_audit_det.match_basis
+rec_audit_det.add_version(c_audit_det.text, CW.SOURCE_ORIGINAL_IMPORT, "controller_import", None)
+check("Audit trail: a deterministic match produces match_method == 'deterministic' on the resulting "
+      "CommentaryRecord, set once at attachment (mirrors dashboard's automated-match edit point)",
+      rec_audit_det.match_method == "deterministic", rec_audit_det.match_method)
+
+# New check 2 -- semantic match (injectable semantic_fn test double, same
+# pattern as the rest of this fixture -- not a real API call).
+c_audit_sem = CW.CommentaryEntry(commentary_id="C-AUDIT-SEM",
+                                  text="Support-side software spend eased off a bit this quarter.")
+stub_audit_sem, _ = counting_semantic_stub(("OBS-RD", "semantic reconciliation: confident match"))
+r_audit_sem = CW.resolve_commentary_matches([c_audit_sem], observation_register, {}, semantic_fn=stub_audit_sem)[0]
+rec_audit_sem = CW.CommentaryRecord(observation_id=r_audit_sem.matched_observation_id)
+rec_audit_sem.match_method = r_audit_sem.method
+rec_audit_sem.match_basis = r_audit_sem.match_basis
+rec_audit_sem.add_version(c_audit_sem.text, CW.SOURCE_ORIGINAL_IMPORT, "controller_import", None)
+check("Audit trail: a semantic match (injected test double) produces match_method == 'semantic' on "
+      "the resulting CommentaryRecord",
+      r_audit_sem.matched and rec_audit_sem.match_method == "semantic",
+      f"matched={r_audit_sem.matched} method={rec_audit_sem.match_method}")
+
+# New check 3 -- manual match. Not a commentary_workflow.py function (the
+# manual path lives entirely in the dashboard's confirm-button branch) --
+# this mirrors that exact assignment sequence: record.match_method="manual",
+# record.match_basis="manually reconciled via Commentary Review", set
+# BEFORE add_version(), exactly as Northwind_Financial_Dashboard.py does.
+rec_audit_manual = CW.CommentaryRecord(observation_id="OBS-RD")
+rec_audit_manual.match_method = "manual"
+rec_audit_manual.match_basis = "manually reconciled via Commentary Review"
+rec_audit_manual.add_version("Manually reconciled commentary text.", CW.SOURCE_ORIGINAL_IMPORT, "controller_import", None)
+check("Audit trail: a manual match produces match_method == 'manual' on the resulting CommentaryRecord",
+      rec_audit_manual.match_method == "manual" and
+      rec_audit_manual.match_basis == "manually reconciled via Commentary Review",
+      rec_audit_manual.match_method)
+
+# New check 4 -- to_dict() -> serialize_commentary_records() round trip.
+serialized = CW.serialize_commentary_records({
+    rec_audit_det.observation_id: rec_audit_det,
+    "OBS-RD-MANUAL": rec_audit_manual,
+})
+check("Audit trail: match_method/match_basis survive a full to_dict() -> "
+      "serialize_commentary_records() round trip unchanged (deterministic record)",
+      serialized[rec_audit_det.observation_id]["match_method"] == "deterministic" and
+      serialized[rec_audit_det.observation_id]["match_basis"] == rec_audit_det.match_basis,
+      serialized[rec_audit_det.observation_id])
+check("Audit trail: match_method/match_basis survive the same round trip unchanged (manual record)",
+      serialized["OBS-RD-MANUAL"]["match_method"] == "manual" and
+      serialized["OBS-RD-MANUAL"]["match_basis"] == "manually reconciled via Commentary Review",
+      serialized["OBS-RD-MANUAL"])
+
+# ===========================================================================
 # Criterion 8 -- existing v4/v5 fixtures still pass. Run as a separate
 # subprocess so this script's own import/monkeypatch state (fake `anthropic`
 # module injections above) can never leak into that run.
