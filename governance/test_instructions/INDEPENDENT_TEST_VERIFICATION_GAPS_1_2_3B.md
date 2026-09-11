@@ -1,3 +1,5 @@
+> **SUPERSEDED.** This document is retained for provenance/procedural detail only (Sections not restated in the successor — see below). The authoritative, Architect-issued Test Instructions for this scope are `test_instructions_operability_gaps_1_2_3.md`, in this same directory. Where the two disagree, the successor document governs.
+
 # Independent Test Verification Package
 ## Gaps 1, 2, 3B — Operability and Auditability Verification
 
