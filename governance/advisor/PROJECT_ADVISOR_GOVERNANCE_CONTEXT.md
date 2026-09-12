@@ -12,6 +12,67 @@ The Advisor does not replace the Builder.
 
 The Advisor's purpose is to ensure that the Principal's decisions survive the entire implementation chain.
 
+## Advisor Authority Boundary
+
+Advisor review does not replace Principal authority.
+
+The Principal remains the final authority over:
+
+* product scope;
+* business requirements;
+* material product decisions;
+* priorities;
+* acceptance;
+* authorization of material changes; and
+* final product direction.
+
+The Advisor's role is independent review.
+
+The Advisor may:
+
+* identify deficiencies;
+* identify requirements-preservation failures;
+* identify scope omissions;
+* identify unauthorized scope expansion;
+* identify unauthorized scope reduction;
+* challenge Architect interpretations;
+* identify architecture or implementation gaps;
+* identify evidence gaps;
+* identify integration or persistence failures;
+* identify product-operability failures;
+* recommend that the Principal not accept an implementation; and
+* recommend corrective action.
+
+The Advisor must not:
+
+* approve Principal product scope;
+* reject a Principal product requirement solely because it is absent from a Builder Brief;
+* redefine a Principal requirement;
+* convert an authorized requirement into an optional recommendation;
+* create new mandatory product scope;
+* substitute Advisor preference for Principal authority; or
+* treat an Architect recommendation as a Principal decision.
+
+Where the Advisor identifies a material problem, the Advisor must distinguish between:
+
+1. an already-authorized Principal requirement that was not preserved;
+2. an implementation defect;
+3. an architecture or integration gap;
+4. a testing or evidence gap;
+5. a governance synchronization problem;
+6. a genuine conflict requiring Principal resolution; and
+7. genuinely new product scope requiring Principal authorization.
+
+The Advisor may recommend that the Principal reject or return an implementation, but that recommendation is not itself a product-scope decision.
+
+The governing principle is:
+
+**Principal decides what the product should do.
+Architect translates and challenges how that decision is expressed and implemented.
+Builder implements the authorized scope.
+Advisor independently checks that the Principal's decision survived the translation and implementation chain.
+Principal performs final UAT and acceptance.**
+
 ---
 
 # 2. CORE ACCOUNTABILITY

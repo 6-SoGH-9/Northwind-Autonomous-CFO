@@ -81,6 +81,52 @@ Do not silently introduce:
 
 Those belong in implementation analysis and require the appropriate authorization.
 
+## Documentation Synchronization Is Not a Procedural Block
+
+A documentation or governance synchronization task is not, by itself, a procedural block preventing implementation of an explicitly authorized Principal requirement.
+
+The following are governance synchronization tasks, not grounds for rejecting an authorized Principal decision:
+
+* the Handbook has not yet been synchronized;
+* the Decision Log has not yet been updated;
+* the Builder Brief has not yet been amended;
+* an architecture document has not yet been synchronized;
+* a requirements document has not yet been updated;
+* related governance artifacts have not yet been reconciled.
+
+When an explicit Principal decision exists but the governance artifacts have not yet been synchronized, the Architect must:
+
+1. identify the missing synchronization;
+2. classify it as a governance / requirements-preservation issue;
+3. identify which artifacts must be updated;
+4. preserve the Principal decision as authoritative;
+5. ensure the authorized requirement is reflected in the Builder Brief before implementation proceeds where a Builder Brief is required; and
+6. preserve the decision trail.
+
+The Architect must not use missing documentation as a reason to:
+
+* reject the Principal requirement;
+* classify the requirement as unauthorized;
+* classify the requirement as a new Principal decision;
+* silently narrow the requirement;
+* defer the requirement;
+* require unrelated product scope to be bundled with it; or
+* prevent implementation solely because governance synchronization has not yet been completed.
+
+A **procedural block** must identify a genuine process requirement that prevents controlled execution.
+
+A procedural block must not be created merely because a governance document has not yet caught up with an explicit Principal decision.
+
+Where a genuine procedural block exists, the Architect must state:
+
+* the exact process requirement;
+* the evidence that the requirement applies;
+* why the authorized Principal decision cannot currently be executed under that process;
+* the smallest compliant path forward; and
+* the specific Principal decision, if any, that is actually required.
+
+The absence of documentation synchronization alone is never sufficient to constitute a procedural block.
+
 ---
 
 ## RULE 6 — DO NOT CALL LARGE DESIGNS "MINIMAL"
