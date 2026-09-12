@@ -14,6 +14,7 @@
 3. Gap 3B-1's "effective date (2026-01-01 or current date)" is corrected: the effective date must be the git-history-derived date established in the Brief (`2026-08-05`, first canonical commit of the constants), not an arbitrary placeholder.
 4. Added Section 5 (D13 sequencing cross-reference), not present in the superseded document.
 5. All other scenarios (1A–1C, 2A–2D, 3B-2 through 3C-3), the regression table, test data requirements, execution timeline, pass/fail criteria, escalation path, and sign-off requirements are preserved unchanged from the superseded document — they were already scoped to the full Gap 2/Gap 3 interpretation now authorized.
+6. **Added, post-Builder-delivery review:** Section 6 (Independent Fixture Construction) and the accompanying Gap 2 archived-snapshot procedure. The real canonical dataset produces zero Phase 3 flags at its current latest period, so Builder built its own fixture to exercise these Gaps at all — that specific fixture must not be reused for independent verification, per the Validation Independence Principle. This section did not exist in the superseded document and was added once this gap was identified during Architect review of Builder's delivery.
 
 ---
 
@@ -108,6 +109,33 @@ The Section H/J independent UAT for D13 (Handbook Section 13) must be run agains
 
 ---
 
-## 6. Test Data, Timeline, Pass/Fail, Escalation, Sign-off
+## 6. Independent Fixture Construction (required — tester-authored, not Builder's)
+
+The real canonical dataset produces **zero Phase 3 flags** at its current latest period. Builder's own regression evidence therefore relies on a constructed fixture (Sales & Marketing / Other Opex, June 2026, +$40,000.00) to exercise Gap 1, Gap 2, and Gap 3 end-to-end at all. Per the Validation Independence Principle, that specific fixture must **not** be reused here — a test run against data Builder already knew about proves non-regression, not genericity. The tester must construct an **independent** fixture, following the procedure below.
+
+### 7.1 Procedure (deterministic, grounded in the real thresholds — not arbitrary)
+
+1. Start from a fresh copy of the canonical `Northwind_Sample_Dataset.xlsx`. Do not reuse `build_test/gap1_fixture.xlsx` or `build_test/gap1_fixture_builder.py`.
+2. Choose a **Department × Category × month** combination different from Builder's (Sales & Marketing / Other Opex / June 2026). Any other Department × Category cell and any other fiscal-quarter-ending month is acceptable — e.g. Customer Success / Software & Tools at the close of a different quarter, or G&A / Other Opex at a different quarter's final month. Pick something whose baseline quarterly value you can read directly from the real `Expenses` sheet.
+3. Inject a dollar change to that cell's final month sufficient to push the resulting QoQ variance for that Department × Category past `DEFAULT_PLAUSIBILITY_QOQ_THRESHOLD` (0.25 / 25%) — compute the actual injected amount from the real prior-quarter total you read in step 2, not a copied constant.
+4. Keep the headcount side of the test meaningful: either leave that department's ending headcount unchanged quarter-over-quarter (to test the "no headcount driver identified" flag path, as Builder's fixture did) or deliberately move it outside `DEFAULT_PLAUSIBILITY_HEADCOUNT_BAND` (±2) if you want to test the alternate flag condition instead — record which you chose and why.
+5. Recompute the dependent `PL_Summary` sheet's affected month row and the `"Total / Avg"` footer row (Total Opex ($), Gross Profit ($), Gross Margin (%)) to reflect the same injected amount — per the standing Fixture internal-consistency corollary. Confirm a clean tie-out (`rollups.py`'s own "Expenses tie to PL_Summary Total Opex" check, max diff $0.0000) before using the fixture as evidence.
+6. Record your predicted flag (QoQ % and headcount change, computed by hand from your own injected values) **before** running the implementation against it.
+
+### 7.2 Gap 2 — producing an archived snapshot to view
+
+`close_history.archive_close()` is not currently wired to the dashboard's live "Approve close" button (a real, flagged, out-of-scope finding — see the Architect's review of this delivery). This means no archived close will appear in the "Review a prior close" selector unless one is created directly. This is expected and is not a workaround to route around — it is the same script-level methodology this project has already used for the Human Approval Gate's Case 5 fixture and `close_orchestrator.py`. To produce a snapshot to test against:
+
+1. Attach your own commentary text to your fixture's flagged observation and let the existing, already-verified deterministic Phase 4/6 mechanics produce a genuine match and validation result — any valid commentary text is sufficient for this purpose; this does **not** require, and is not a substitute for, D13's Section H/J semantic-reconciliation UAT content.
+2. Call `close_history.archive_close()` directly (script-level, not through the UI) with your fixture's observation register and the resulting Commentary Record, to produce an archived snapshot independent of Builder's own test scripts.
+3. Point the dashboard at this snapshot (e.g. via `NORTHWIND_RAW_DATASET_PATH` for the live period plus your archived snapshot in `close_history/`) and proceed with Test Scenarios 2A–2E against it.
+
+### 7.3 Why this matters
+
+If the tester reuses Builder's exact fixture and exact commentary, every Gap 1/2/3 scenario above would only confirm the fix works on the one case Builder already tested against — not that it generalizes. A genuinely independent fixture, built to this same procedure but with different numbers, is what actually tests genericity.
+
+---
+
+## 7. Test Data, Timeline, Pass/Fail, Escalation, Sign-off
 
 Unchanged from the superseded document (`INDEPENDENT_TEST_VERIFICATION_GAPS_1_2_3B.md`): canonical Q1 FY2025–Q4 FY2026 dataset baseline (D11/D14), the seven-phase execution timeline (planning → Gap 1 → Gap 2 → Gap 3 → regression → integration → sign-off), the PASS/FAIL/CONDITIONAL-PASS criteria, the three-tier escalation path (minor/major/governance defect), and the required sign-off artifacts (Verification Report, Pass/Fail Assessment, Known Limitations, Recommendation). Reproduced in full in the superseded document; not restated here to avoid two divergent copies of the same procedural text — see that document (Section 5 of the reconciliation report) for the exact wording, which remains authoritative for these procedural sections only.
