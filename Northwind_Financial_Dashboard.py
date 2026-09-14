@@ -520,6 +520,14 @@ with tab_bva:
 
 with tab_close:
     st.title("Close Validation Status")
+    st.caption(
+        "This tab always validates and, on approval, archives the dataset's newest available "
+        f"quarter (currently **{R.fmt_period_label(period_order[-1])}**) — never the sidebar's "
+        "'Current period' selector above, which only changes the current/prior comparison basis "
+        "for the other dashboard pages (Revenue Performance, Cost Structure, Regional/Product "
+        "Investment, Headcount & Efficiency, Budget vs Actual). It has no effect on Phase 2/3, the "
+        "observation register, Commentary Review, or which period gets archived here."
+    )
 
     # --- Resolve the latest APPROVED close from real Close History, and run
     # close_validation.py's production Phase 2/3 functions against it. This
@@ -609,7 +617,17 @@ with tab_close:
     # to "approved".
     if "close_approval_status" not in st.session_state:
         st.session_state["close_approval_status"] = "not_yet_decided"
-    executive_ready = st.session_state["close_approval_status"] == "approved"
+    # Gap 4, Item 3: "Executive Ready" must reflect that the approval was
+    # made DURABLE (archive_close() succeeded and the close is retrievable
+    # from Close History) -- not merely that the in-session flag was set.
+    # If Item 1's archive call errored (1d) or simply hasn't fired yet on
+    # this rerun, the strip must not claim the close is durably complete.
+    _gap4_durable_close = close_history.resolve_latest_approved_close()
+    executive_ready = (
+        st.session_state["close_approval_status"] == "approved"
+        and _gap4_durable_close is not None
+        and _gap4_durable_close["period_label"] == period_order[-1]
+    )
 
     states = [
         ("Close Received", "Phase 0", True),
@@ -1003,6 +1021,17 @@ with tab_close:
         "rejected": "❌ Rejected / returned",
     }[_approval_status]
     st.markdown(f"**Current status:** {_status_display}")
+    if st.session_state.get("last_archive_error"):
+        st.error(
+            f"This period ('{R.fmt_period_label(st.session_state['last_archive_error'])}') is "
+            "already archived in Close History — approval status is set, but no new snapshot was "
+            "written. See the historical-close view (Gap 2) to review the existing archived record."
+        )
+    elif st.session_state.get("last_archived_close_period") and _approval_status == "approved":
+        st.caption(
+            f"Archived to Close History as '{R.fmt_period_label(st.session_state['last_archived_close_period'])}' "
+            "this session."
+        )
     st.caption(
         "This action is independent of Phase 6's assessment of any individual commentary item. "
         "An Insufficient or Contradicted result (or no commentary at all) is a flag for you to "
@@ -1015,6 +1044,59 @@ with tab_close:
             # Section D: available in every state, including re-affirming
             # an already-approved close.
             st.session_state["close_approval_status"] = "approved"
+            # ---------------------------------------------------------
+            # Gap 4 (builder_brief_operability_gap4_close_durability.md),
+            # Item 1: make this approval durable by calling
+            # close_history.archive_close() -- previously this button did
+            # nothing but flip a session-state flag, so no approved close
+            # was ever recorded outside the current browser session. This
+            # fires exactly once per genuine "Approve close" click (never
+            # as a side effect of an unrelated rerun where the flag
+            # already happens to be "approved") and always targets
+            # period_order[-1] -- the dataset's true latest quarter --
+            # never the sidebar's `current_period` (Item 2).
+            # ---------------------------------------------------------
+            _gap4_period_label = period_order[-1]
+            _gap4_commentary_records = st.session_state.get("commentary_records", {})
+            _gap4_phase2_flag_count = (
+                len(phase2_result.flagged_rows) if phase2_result.status == CV.STATUS_OK else 0
+            )
+            _gap4_phase3_flag_count = (
+                len(phase3_result.flagged_rows) if phase3_result.status == CV.STATUS_OK else 0
+            )
+            _gap4_prior_close = close_history.resolve_latest_approved_close()
+            try:
+                close_history.archive_close(
+                    period_label=_gap4_period_label,
+                    raw_dataset_src=R.RAW,
+                    rollups_output_src="rollups_output.xlsx",
+                    observations_df=observation_register,
+                    # Phase 7 narrative generation is gated behind this
+                    # same approval and happens as a separate, later user
+                    # action (it cannot have run yet at the moment this
+                    # click fires) -- reflect that honestly rather than
+                    # inventing narrative text. If a narrative or a
+                    # downloaded-prompt fallback was produced earlier in
+                    # this session for any reason, use it; otherwise this
+                    # is legitimately empty, and archive_close() writes
+                    # narrative.txt as an empty file, not a placeholder.
+                    narrative_text=st.session_state.get("phase7_narrative_text", ""),
+                    phase2_flag_count=_gap4_phase2_flag_count,
+                    phase3_flag_count=_gap4_phase3_flag_count,
+                    workflow_state="Executive Ready",
+                    prior_close_period_label=(
+                        _gap4_prior_close["period_label"] if _gap4_prior_close is not None else None
+                    ),
+                    commentary_record=CWF.serialize_commentary_records(_gap4_commentary_records),
+                )
+                st.session_state["last_archived_close_period"] = _gap4_period_label
+                st.session_state["last_archive_error"] = None
+            except FileExistsError:
+                # Item 1d: this exact period is already archived (this
+                # session or a prior one). Do not overwrite, version, or
+                # silently no-op -- surface a clear, specific message.
+                # D10's immutability is preserved exactly as-is.
+                st.session_state["last_archive_error"] = _gap4_period_label
             st.rerun()
     with gate_cols[1]:
         if st.button("Reject / return close", key="reject_close_btn"):
