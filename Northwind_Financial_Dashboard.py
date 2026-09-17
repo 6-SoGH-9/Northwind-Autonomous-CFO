@@ -13,6 +13,7 @@ chat to get the narrative manually.
 """
 
 import os
+import shutil
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,6 +22,7 @@ import rollups as R  # noqa: the import itself runs sections 1-14 (all data buil
 import close_history
 import close_validation as CV  # production Phase 2/3 service — Cycle 3 Task 2
 import commentary_workflow as CWF  # Phase 4-6 (D13 scope) — Brief v4
+import period_lifecycle as PL  # D15 — period lifecycle, reopen, correction/reprocessing
 
 
 GOOD = "#1e8e3e"   # green — favorable variance
@@ -520,13 +522,45 @@ with tab_bva:
 
 with tab_close:
     st.title("Close Validation Status")
+
+    # -------------------------------------------------------------------
+    # D15, Section 5.B — Authoritative period selection (absorbs Gap 1).
+    #
+    # This is the SOLE source of `target_period` for the close workflow —
+    # a distinct control from the sidebar/explorer period selector above,
+    # which remains display-only for the other eight IA pages and must
+    # never independently determine the close target. No downstream
+    # component in this tab may re-derive the period from period_order[-1],
+    # the sidebar's current_period, or any other alternate path — every
+    # existing internal derivation this tab previously used
+    # (Phase 3's target_period default, the evidence package's
+    # current_period/prior_period, archive_close()'s period_label) now
+    # reads target_period, defined here, once.
+    # -------------------------------------------------------------------
+    _close_selectable_periods = [p for p in R.quarter_order if R.quarter_order.index(p) > 0]
+    target_period = st.selectbox(
+        "Select period to close",
+        _close_selectable_periods,
+        index=len(_close_selectable_periods) - 1,
+        format_func=R.fmt_period_label,
+        key="target_period_to_close",
+        help=(
+            "Drives Phase 2/3 validation, the observation register, Phase 6 evidence, and which "
+            "period is archived on approval — independent of the sidebar's 'Current period' "
+            "selector above, which only changes the comparison basis shown on the other dashboard "
+            "pages."
+        ),
+    )
+    _target_period_idx = R.quarter_order.index(target_period)
+    target_prior_period = R.quarter_order[_target_period_idx - 1] if _target_period_idx > 0 else None
+
     st.caption(
-        "This tab always validates and, on approval, archives the dataset's newest available "
-        f"quarter (currently **{R.fmt_period_label(period_order[-1])}**) — never the sidebar's "
-        "'Current period' selector above, which only changes the current/prior comparison basis "
-        "for the other dashboard pages (Revenue Performance, Cost Structure, Regional/Product "
-        "Investment, Headcount & Efficiency, Budget vs Actual). It has no effect on Phase 2/3, the "
-        "observation register, Commentary Review, or which period gets archived here."
+        f"This tab validates, generates observations for, and (on approval) archives "
+        f"**{R.fmt_period_label(target_period)}** — the period selected above, not the sidebar's "
+        "'Current period' selector, which only changes the current/prior comparison basis for the "
+        "other dashboard pages (Revenue Performance, Cost Structure, Regional/Product Investment, "
+        "Headcount & Efficiency, Budget vs Actual). It has no effect on Phase 2/3, the observation "
+        "register, Commentary Review, or which period gets archived here."
     )
 
     # --- Resolve the latest APPROVED close from real Close History, and run
@@ -555,8 +589,11 @@ with tab_close:
         headcount=R.headcount,
         period_col="Fiscal Quarter",
         period_order=R.quarter_order,
-        # target_period defaults to the latest quarter in R.quarter_order —
-        # no hardcoded period label here, unlike the pre-Task-2 demo tab.
+        # D15, Section 5.B: explicit target_period from the single
+        # "Select period to close" control above — no longer defaulting to
+        # period_order[-1] implicitly, and never re-derived from the
+        # sidebar's current_period.
+        target_period=target_period,
     )
 
     if resolved_prior_close is not None:
@@ -622,11 +659,20 @@ with tab_close:
     # from Close History) -- not merely that the in-session flag was set.
     # If Item 1's archive call errored (1d) or simply hasn't fired yet on
     # this rerun, the strip must not claim the close is durably complete.
-    _gap4_durable_close = close_history.resolve_latest_approved_close()
+    #
+    # D15 Item 2, correction 3: uses resolve_latest_approved_close_FOR_PERIOD
+    # (target_period), never resolve_latest_approved_close() -- the latter
+    # ranks by approval_timestamp GLOBALLY across every period in Close
+    # History, so approving a reopened HISTORICAL period's v2 (Item 2)
+    # would otherwise become "the latest approved close" by timestamp and
+    # silently flip this unrelated target_period's own Executive Ready
+    # status to False. See close_history.resolve_latest_approved_close_for_period()
+    # for the full rationale.
+    _gap4_durable_close = close_history.resolve_latest_approved_close_for_period(target_period)
     executive_ready = (
         st.session_state["close_approval_status"] == "approved"
         and _gap4_durable_close is not None
-        and _gap4_durable_close["period_label"] == period_order[-1]
+        and _gap4_durable_close["period_label"] == target_period
     )
 
     states = [
@@ -787,17 +833,31 @@ with tab_close:
     if "commentary_file_supplied" not in st.session_state:
         st.session_state["commentary_file_supplied"] = False
 
-    hc_current_df = hc_dept_df[hc_dept_df[period_col] == current_period][["Department", "Ending Headcount"]]
-    hc_prior_df = hc_dept_df[hc_dept_df[period_col] == prior_period][["Department", "Ending Headcount"]]
+    # D15, Section 5.B (absorbs Gap 1's evidence-package period-sourcing
+    # defect): these are keyed to target_period — the period this tab is
+    # actually validating and will archive — never to the sidebar's
+    # current_period/prior_period. R.hc_dept_q / R.exp_by_dept_cat_q are
+    # used explicitly (quarterly grain) rather than the cadence-toggled
+    # hc_dept_df/exp_dept_cat_df, because Phase 3 (and therefore this
+    # tab's observation register) always operates at quarterly grain
+    # regardless of the sidebar's Quarterly/Annual cadence radio — using
+    # the cadence-toggled frames here would silently break whenever the
+    # radio is set to Annual, independent of the sidebar period issue.
+    hc_current_df = R.hc_dept_q[R.hc_dept_q["Fiscal Quarter"] == target_period][["Department", "Ending Headcount"]]
+    hc_prior_df = (
+        R.hc_dept_q[R.hc_dept_q["Fiscal Quarter"] == target_prior_period][["Department", "Ending Headcount"]]
+        if target_prior_period is not None
+        else R.hc_dept_q.iloc[0:0][["Department", "Ending Headcount"]]
+    )
 
     def _dept_category_breakdown_for(obs_row):
         # ALL categories for this department this period (D14), not just the
         # flagged one -- category_reallocation claims (Phase 6) name a
         # DIFFERENT category as the true driver, so checking that requires
         # the full department breakdown, not a single filtered row.
-        matches = exp_dept_cat_df[
-            (exp_dept_cat_df["Department"] == obs_row["Department"])
-            & (exp_dept_cat_df[period_col] == current_period)
+        matches = R.exp_by_dept_cat_q[
+            (R.exp_by_dept_cat_q["Department"] == obs_row["Department"])
+            & (R.exp_by_dept_cat_q["Fiscal Quarter"] == target_period)
         ]
         return matches if not matches.empty else None
 
@@ -1052,11 +1112,24 @@ with tab_close:
             # was ever recorded outside the current browser session. This
             # fires exactly once per genuine "Approve close" click (never
             # as a side effect of an unrelated rerun where the flag
-            # already happens to be "approved") and always targets
-            # period_order[-1] -- the dataset's true latest quarter --
-            # never the sidebar's `current_period` (Item 2).
+            # already happens to be "approved") and targets the single
+            # authoritative `target_period` set by the "Select period to
+            # close" control above (D15, Section 5.B — absorbs Gap 1 and
+            # Gap 4's Item 2 into one flow) -- never period_order[-1]
+            # (which is cadence-dependent and not necessarily a quarter
+            # when the sidebar cadence is Annual) and never the sidebar's
+            # `current_period`.
+            #
+            # This button always archives at version=1 -- it is a normal,
+            # first-time close of target_period, not a reopen/correction.
+            # D15's versioned-correction path (Sections 5.C-5.D, a
+            # two-step reopen producing v2+) is separate, not-yet-built
+            # scope; this handler must not invent an uncontrolled
+            # alternate way to reach version 2, so a period already
+            # archived at v1 still surfaces Item 1d's message below,
+            # exactly as before this control existed.
             # ---------------------------------------------------------
-            _gap4_period_label = period_order[-1]
+            _gap4_period_label = target_period
             _gap4_commentary_records = st.session_state.get("commentary_records", {})
             _gap4_phase2_flag_count = (
                 len(phase2_result.flagged_rows) if phase2_result.status == CV.STATUS_OK else 0
@@ -1108,6 +1181,325 @@ with tab_close:
             # separate return-reason mechanism.
             st.session_state["close_approval_status"] = "rejected"
             st.rerun()
+
+    # -----------------------------------------------------------------------
+    # D15, Section 5.C — Reopen a previously closed period (two-step,
+    # cancel/abandon-safe transactional boundary).
+    #
+    # Scope note: this section implements 5.C (the reopen transaction
+    # itself) only. 5.D (correction intake: accepting new/corrected source
+    # data and new commentary, producing a candidate version) is NOT YET
+    # IMPLEMENTED -- see the message shown after Step 2 confirmation below.
+    # Per the Brief, NEITHER screen writes to close_history/ under any
+    # circumstance; only a future 5.D implementation would produce a
+    # persisted (still not-yet-approved) candidate version, and even that
+    # is never written until Human Approval Gate sign-off (5.J, unchanged).
+    # -----------------------------------------------------------------------
+    st.divider()
+    st.subheader("Reopen a previously closed period")
+
+    _reopen_candidates = sorted(
+        {label for (label, meta, folder) in close_history.list_approved_closes()},
+        key=lambda p: R.quarter_order.index(p) if p in R.quarter_order else -1,
+    )
+
+    if "reopen_step" not in st.session_state:
+        st.session_state["reopen_step"] = 0  # 0 = not started, 1 = Step 1 shown, 2 = confirmed
+    if "reopen_target_period" not in st.session_state:
+        st.session_state["reopen_target_period"] = None
+
+    if not _reopen_candidates:
+        st.caption("No approved closes exist yet in Close History — nothing to reopen.")
+    else:
+        reopen_period = st.selectbox(
+            "Previously closed period to reopen",
+            _reopen_candidates,
+            format_func=R.fmt_period_label,
+            key="reopen_period_select",
+        )
+
+        if st.session_state["reopen_step"] == 0:
+            if st.button("Request reopen", key="reopen_request_btn"):
+                st.session_state["reopen_step"] = 1
+                st.session_state["reopen_target_period"] = reopen_period
+                st.rerun()
+
+        elif st.session_state["reopen_step"] == 1:
+            _rp = st.session_state["reopen_target_period"]
+            _latest = close_history.resolve_latest_approved_close()
+            _idx = R.quarter_order.index(_rp) if _rp in R.quarter_order else -1
+            _downstream = R.quarter_order[_idx + 1:] if _idx >= 0 else []
+            st.warning(
+                f"**Step 1 — Consequence review for {R.fmt_period_label(_rp)}**\n\n"
+                f"- Current approved version: v{_latest['metadata'].get('version', 1) if _latest else '?'}\n"
+                f"- Reopening will require new/corrected data and commentary, re-validation, and "
+                f"re-approval through the Human Approval Gate before anything is archived.\n"
+                f"- Chronologically downstream periods that could be affected if this correction "
+                f"changes {R.fmt_period_label(_rp)}'s canonical state: "
+                f"{', '.join(R.fmt_period_label(p) for p in _downstream) if _downstream else '(none — terminal period)'}\n"
+                f"- **Nothing is written to Close History at this step.** No persistent state change "
+                "occurs until Step 2 is explicitly confirmed."
+            )
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                if st.button("Cancel", key="reopen_step1_cancel_btn"):
+                    st.session_state["reopen_step"] = 0
+                    st.session_state["reopen_target_period"] = None
+                    st.rerun()
+            with _c2:
+                if st.button("Continue to final confirmation", key="reopen_step1_continue_btn"):
+                    st.session_state["reopen_step"] = 2
+                    st.rerun()
+
+        elif st.session_state["reopen_step"] == 2:
+            _rp = st.session_state["reopen_target_period"]
+            st.error(
+                f"**Step 2 — Final confirmation**\n\n"
+                f"Confirming will begin correction intake for {R.fmt_period_label(_rp)}. The prior "
+                "approved version remains untouched and immutable (D10) regardless of what happens "
+                "next."
+            )
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                if st.button("Cancel", key="reopen_step2_cancel_btn"):
+                    st.session_state["reopen_step"] = 0
+                    st.session_state["reopen_target_period"] = None
+                    st.rerun()
+            with _c2:
+                if st.button("Confirm reopen", key="reopen_step2_confirm_btn"):
+                    # 5.C ends here. Confirming records ONLY session state
+                    # (no close_history/ write of any kind) and hands off to
+                    # 5.D (correction intake) below.
+                    st.session_state["reopen_step"] = 3
+                    st.rerun()
+
+        elif st.session_state["reopen_step"] == 3:
+            _rp = st.session_state["reopen_target_period"]
+            st.info(
+                f"Reopen confirmed for {R.fmt_period_label(_rp)} (session state only — no Close "
+                "History write has occurred yet)."
+            )
+
+            # -----------------------------------------------------------
+            # D15, Section 5.D — Correction intake and reprocessing.
+            #
+            # Accepts a corrected raw dataset for the reopened period, runs
+            # it through the REAL rollups.py pipeline in an isolated
+            # scratch directory (never touching the live session's data or
+            # production files -- see period_lifecycle.compute_candidate_rollups_output),
+            # re-runs Phase 2/3 against the corrected data for target
+            # period `_rp`, and performs the Section 5.E numerical-impact
+            # comparison of the candidate's six canonical outputs against
+            # THIS PERIOD'S OWN previously-approved version (D15 Item 2
+            # fix, below -- not the global latest approved close, which
+            # would compare against an unrelated period whenever one
+            # exists).
+            #
+            # Explicitly NOT covered by this pass: candidate Commentary
+            # intake through Phase 4-6, and 5.G's live downstream
+            # propagation walk (period_lifecycle.run_propagation_chain is
+            # implemented and independently unit-tested, but is not yet
+            # driven from this UI across multiple periods in one click).
+            # -----------------------------------------------------------
+            _corrected_file = st.file_uploader(
+                "Corrected raw dataset (.xlsx, same shape as the canonical dataset)",
+                type=["xlsx"],
+                key="reopen_corrected_dataset_upload",
+            )
+
+            if _corrected_file is not None:
+                if st.button("Run correction intake", key="reopen_run_correction_btn"):
+                    with st.spinner("Regenerating candidate outputs against the corrected dataset..."):
+                        import tempfile as _tempfile
+
+                        _tmp_dir = _tempfile.mkdtemp(prefix="d15_upload_")
+                        _tmp_raw_path = os.path.join(_tmp_dir, "corrected_dataset.xlsx")
+                        with open(_tmp_raw_path, "wb") as _f:
+                            _f.write(_corrected_file.getvalue())
+
+                        _candidate_scratch = None
+                        try:
+                            _candidate_path, _candidate_log, _candidate_scratch = PL.compute_candidate_rollups_output(
+                                _tmp_raw_path, repo_dir=os.path.dirname(os.path.abspath(__file__))
+                            )
+
+                            # D15 Item 2 fix: this period's OWN prior
+                            # approved close, never the global latest --
+                            # same rationale as the Executive Ready fix
+                            # above (close_history.resolve_latest_approved_close_for_period).
+                            _prior_close = close_history.resolve_latest_approved_close_for_period(_rp)
+                            _prior_expenses_for_candidate = None
+                            if _prior_close is not None:
+                                _prior_expenses_for_candidate = pd.read_excel(
+                                    _prior_close["raw_dataset_path"], "Expenses"
+                                )
+                                _prior_expenses_for_candidate["Date"] = pd.to_datetime(
+                                    _prior_expenses_for_candidate["Date"]
+                                )
+
+                            _cand_phase2, _cand_phase3 = PL.revalidate_period_from_raw(
+                                _tmp_raw_path, _rp, R.quarter_order, R, CV,
+                                prior_expenses=_prior_expenses_for_candidate,
+                            )
+
+                            if _prior_close is None:
+                                st.error(
+                                    f"No previously-approved close exists for {R.fmt_period_label(_rp)} "
+                                    "itself to compare the candidate against -- 5.E's numerical-impact "
+                                    "comparison requires this period's own prior approved snapshot."
+                                )
+                            else:
+                                _numerical_impact, _comparison = PL.compare_period_outputs(
+                                    _rp, _prior_close["rollups_output_path"], _candidate_path
+                                )
+
+                                # D15 Item 2: persist the corrected dataset
+                                # and the candidate's rollups_output.xlsx in
+                                # a session-scoped temp location that
+                                # survives past this rerun -- referenced
+                                # from st.session_state["reopen_candidate"],
+                                # cleaned up only once the candidate is
+                                # resolved (approved or reset), never here.
+                                # (_tmp_dir / _candidate_scratch below are
+                                # transient scratch space for THIS click
+                                # only and are cleaned up unconditionally
+                                # in the finally block, same as before.)
+                                _persist_dir = _tempfile.mkdtemp(prefix="d15_candidate_persist_")
+                                _persisted_raw_path = os.path.join(_persist_dir, "corrected_dataset.xlsx")
+                                shutil.copyfile(_tmp_raw_path, _persisted_raw_path)
+                                _persisted_rollups_path = os.path.join(_persist_dir, "rollups_output.xlsx")
+                                shutil.copyfile(_candidate_path, _persisted_rollups_path)
+
+                                st.session_state["reopen_candidate"] = {
+                                    "period": _rp,
+                                    "numerical_impact": _numerical_impact,
+                                    "comparison": _comparison,
+                                    "phase2_result": _cand_phase2,
+                                    "phase3_result": _cand_phase3,
+                                    "raw_dataset_path": _persisted_raw_path,
+                                    "rollups_output_path": _persisted_rollups_path,
+                                    "persist_dir": _persist_dir,
+                                }
+                                # A newly (re)computed candidate always
+                                # starts undecided -- never inherits a
+                                # stale approved/rejected status from a
+                                # prior candidate for this same period.
+                                st.session_state["reopen_candidate_approval_status"] = "not_yet_decided"
+
+                                st.success(
+                                    f"Candidate regenerated for {R.fmt_period_label(_rp)}. "
+                                    f"**numerical_impact = {_numerical_impact}** "
+                                    f"(reprocessing_required for this explicitly-reopened period is `True` "
+                                    "unconditionally per 5.F, regardless of this value)."
+                                )
+                                for _out_name, _res in _comparison.items():
+                                    _badge = "🔶 impact" if _res.impact else "no impact"
+                                    st.write(f"- **{_out_name}** — {_badge} ({len(_res.diffs_df)} differing row(s))")
+                                    if _res.impact and len(_res.diffs_df) > 0:
+                                        st.dataframe(fmt_display_df(_res.diffs_df), use_container_width=True)
+                        except RuntimeError as _err:
+                            st.error(str(_err))
+                        finally:
+                            shutil.rmtree(_tmp_dir, ignore_errors=True)
+                            if _candidate_scratch:
+                                shutil.rmtree(_candidate_scratch, ignore_errors=True)
+
+            # -----------------------------------------------------------
+            # D15 Item 2 — candidate-scoped Human Approval Gate + v2
+            # archival. This is a SEPARATE session-state key
+            # ("reopen_candidate_approval_status") from the live current
+            # close's "close_approval_status" -- it must never read or
+            # write that key, so approving/rejecting a candidate can never
+            # affect the live target_period's own Gate state, and vice
+            # versa. Exactly one archive_close() call exists for the
+            # candidate, inside the Approve handler below; Reject is a
+            # status change only, with no archive call and no other side
+            # effect; Cancel/abandonment (Steps 1-2 above, and simply
+            # never running correction intake here) leave close_history/
+            # untouched by construction, since nothing else in this
+            # section calls archive_close().
+            # -----------------------------------------------------------
+            if "reopen_candidate" in st.session_state and st.session_state["reopen_candidate"]["period"] == _rp:
+                _cand = st.session_state["reopen_candidate"]
+                st.divider()
+                st.subheader("Candidate approval")
+                if "reopen_candidate_approval_status" not in st.session_state:
+                    st.session_state["reopen_candidate_approval_status"] = "not_yet_decided"
+                st.write(f"Candidate status: **{st.session_state['reopen_candidate_approval_status']}**")
+
+                _gate_c1, _gate_c2 = st.columns(2)
+                with _gate_c1:
+                    if st.button("Approve candidate close", key="approve_candidate_close_btn"):
+                        try:
+                            # Correction 1: version computed dynamically,
+                            # never hardcoded.
+                            _candidate_version = close_history.next_version_for_period(_rp)
+                            # Correction 2: chronological predecessor,
+                            # never resolve_latest_approved_close().
+                            _rp_idx = R.quarter_order.index(_rp)
+                            _candidate_prior_period_label = (
+                                R.quarter_order[_rp_idx - 1] if _rp_idx > 0 else None
+                            )
+                            # Correction 4: existing, unmodified
+                            # build_observation_register(), fed the
+                            # candidate's own Phase 2/3 results.
+                            _candidate_obs_df = CWF.build_observation_register(
+                                _cand["phase2_result"], _cand["phase3_result"], R.fmt_period_label, CV.STATUS_OK
+                            )
+
+                            # The ONE archive_close() call site for this
+                            # candidate. Correction 5: commentary_record
+                            # passed as None explicitly -- candidate
+                            # Commentary intake does not exist yet, and
+                            # nothing here fabricates a substitute.
+                            _archived_folder, _archived_meta = close_history.archive_close(
+                                period_label=_rp,
+                                raw_dataset_src=_cand["raw_dataset_path"],
+                                rollups_output_src=_cand["rollups_output_path"],
+                                observations_df=_candidate_obs_df,
+                                narrative_text="",
+                                phase2_flag_count=len(_cand["phase2_result"].flagged_rows),
+                                phase3_flag_count=len(_cand["phase3_result"].flagged_rows),
+                                workflow_state="Executive Ready",
+                                prior_close_period_label=_candidate_prior_period_label,
+                                commentary_record=None,
+                                version=_candidate_version,
+                                extra_metadata=PL.build_lineage_metadata(
+                                    trigger=PL.TRIGGER_EXPLICIT_REOPEN,
+                                    comparison_result=_cand["comparison"],
+                                ),
+                            )
+                            st.session_state["reopen_candidate_approval_status"] = "approved"
+                            # Temp files are cleaned up only now that the
+                            # candidate is RESOLVED (approved) -- never
+                            # earlier.
+                            if _cand.get("persist_dir"):
+                                shutil.rmtree(_cand["persist_dir"], ignore_errors=True)
+                            st.success(
+                                f"Archived {R.fmt_period_label(_rp)} as v{_candidate_version} at {_archived_folder}."
+                            )
+                        except FileExistsError as _err:
+                            st.error(str(_err))
+                        st.rerun()
+                with _gate_c2:
+                    if st.button("Reject candidate", key="reject_candidate_close_btn"):
+                        # Status change only. No archive call. No other
+                        # side effect -- per the Architect's constraint,
+                        # temp-file cleanup for a rejected candidate is
+                        # deliberately left to "Start over" below, not
+                        # folded in here.
+                        st.session_state["reopen_candidate_approval_status"] = "rejected"
+                        st.rerun()
+
+            if st.button("Start over", key="reopen_reset_btn"):
+                _existing_candidate = st.session_state.get("reopen_candidate")
+                if _existing_candidate and _existing_candidate.get("persist_dir"):
+                    shutil.rmtree(_existing_candidate["persist_dir"], ignore_errors=True)
+                st.session_state["reopen_step"] = 0
+                st.session_state["reopen_target_period"] = None
+                st.session_state.pop("reopen_candidate", None)
+                st.session_state.pop("reopen_candidate_approval_status", None)
+                st.rerun()
 
 with tab_region_invest:
     st.title("Regional Revenue & Go-to-Market Investment")
