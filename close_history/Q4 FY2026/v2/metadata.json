@@ -1,0 +1,89 @@
+{
+  "period_label": "Q4 FY2026",
+  "version": 2,
+  "approval_timestamp": "2026-09-19T15:17:29.439546+00:00",
+  "workflow_state": "Executive Ready",
+  "phase2_flag_count": 2,
+  "phase3_flag_count": 1,
+  "prior_close_period_label": "Q3 FY2026",
+  "pipeline_git_commit_hash": "ca8f8ef36a982dce7131003f0ce98f3a49a78731",
+  "dashboard_html": null,
+  "board_deck_pptx": null,
+  "commentary_record": {},
+  "trigger": "explicit reopen",
+  "predecessor": null,
+  "epsilon_used": 0.005,
+  "numerical_impact_by_output": {
+    "PL_Quarterly": {
+      "output_name": "PL_Quarterly",
+      "period_label": "Q4 FY2026",
+      "impact": true,
+      "diff_row_count": 1,
+      "diffs": [
+        {
+          "Fiscal Quarter": "Q4 FY2026",
+          "Total Revenue ($)_before": 4016905.92,
+          "Total Opex ($)_before": 2482355.83,
+          "Total Revenue ($)_after": 4016905.92,
+          "Total Opex ($)_after": 3482355.83,
+          "_merge": "both"
+        }
+      ]
+    },
+    "Rev_by_Region_Q": {
+      "output_name": "Rev_by_Region_Q",
+      "period_label": "Q4 FY2026",
+      "impact": false,
+      "diff_row_count": 0,
+      "diffs": []
+    },
+    "Rev_by_Product_Q": {
+      "output_name": "Rev_by_Product_Q",
+      "period_label": "Q4 FY2026",
+      "impact": false,
+      "diff_row_count": 0,
+      "diffs": []
+    },
+    "Exp_by_Dept_Cat_Q": {
+      "output_name": "Exp_by_Dept_Cat_Q",
+      "period_label": "Q4 FY2026",
+      "impact": true,
+      "diff_row_count": 1,
+      "diffs": [
+        {
+          "Department": "G&A",
+          "Category": "Other Opex",
+          "Fiscal Quarter": "Q4 FY2026",
+          "Amount ($)_before": 75752.45,
+          "Amount ($)_after": 1075752.45,
+          "_merge": "both"
+        }
+      ]
+    },
+    "Headcount_Q": {
+      "output_name": "Headcount_Q",
+      "period_label": "Q4 FY2026",
+      "impact": false,
+      "diff_row_count": 0,
+      "diffs": []
+    },
+    "BvA_Q": {
+      "output_name": "BvA_Q",
+      "period_label": "Q4 FY2026",
+      "impact": true,
+      "diff_row_count": 1,
+      "diffs": [
+        {
+          "Line Item": "G&A",
+          "Fiscal Quarter": "Q4 FY2026",
+          "Budget ($)_before": 434209.15320331,
+          "Actual ($)_before": 445883.01,
+          "Budget ($)_after": 1504071.141006884,
+          "Actual ($)_after": 1445883.01,
+          "_merge": "both"
+        }
+      ]
+    }
+  },
+  "numerical_impact": true
+}

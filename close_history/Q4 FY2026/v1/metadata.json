@@ -1,0 +1,13 @@
+{
+  "period_label": "Q4 FY2026",
+  "version": 1,
+  "approval_timestamp": "2026-09-19T15:16:49.867991+00:00",
+  "workflow_state": "Executive Ready",
+  "phase2_flag_count": 0,
+  "phase3_flag_count": 0,
+  "prior_close_period_label": null,
+  "pipeline_git_commit_hash": "ca8f8ef36a982dce7131003f0ce98f3a49a78731",
+  "dashboard_html": null,
+  "board_deck_pptx": null,
+  "commentary_record": {}
+}

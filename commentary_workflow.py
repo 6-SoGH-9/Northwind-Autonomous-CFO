@@ -1438,3 +1438,104 @@ def build_narrative_commentary_section(
               "state plainly that it remains unresolved.)"
         )
     return "".join(blocks)
+
+
+# ---------------------------------------------------------------------------
+# D17-BB-001 — Movement-Concentration Narrative Component Detail
+#
+# Governing Decision Log entry: D17. Per-segment component-breakdown detail
+# for the Phase 7 narrative, for all four observation types (Revenue by
+# Region, Revenue by Product Line, Software & Tools by Department, Other
+# Opex by Department), on the same net-variance, signed basis as
+# rollups.build_breadth_concentration() (Brief Section 3), so the two never
+# disagree in the same narrative block (Brief Section 2/5 -- this was a
+# demonstrated dependency, not a scheduling convenience).
+#
+# Principal correction (this session, superseding D17-BB-001's original
+# two-line-item Expenses design -- see the Return Report): Expenses is now a
+# three-level hierarchy (Total Expenses -> Category -> Department, with
+# Salaries & Benefits added as a third Category alongside Software & Tools
+# and Other Opex), and every level's % share and driver/offsetting
+# classification is computed against Total Expenses' own net variance, not
+# any subtotal. total_var (this line item's own displayed subtotal) and
+# share_reference_total (the denominator actually used for %/sign) are
+# therefore two distinct parameters below -- equal for Revenue and for the
+# "Expenses" Total line item itself, but different for the Category/
+# Department rows beneath it.
+#
+# NOTE ON MODULE BOUNDARY (flagged for Architect review -- see Return
+# Report): the Brief's Section 0/Section 4 refer to "the original D17
+# package" and "the four observation types, their fixed segment lists...
+# already authorized under D17" as pre-existing context this Brief builds
+# on. Direct inspection of the canonical checkout this was implemented
+# against (commit 29691e7f94db58385f3aa5850a8f607e38992294) found no prior
+# D17 scaffolding anywhere: no component-breakdown code in this module or
+# in northwind_narrative_prompt.md, and no D15/D16/D17 entries anywhere in
+# project_handbook.md (v2.19). This function is therefore new code, written
+# solely from this Brief's explicit format spec (Section 4), Section 0's
+# data-source references, and the Principal's direct corrections in this
+# session -- not a continuation of an existing D17 implementation this
+# Builder could locate and match conventions against.
+# ---------------------------------------------------------------------------
+def build_movement_component_detail(component_df, dim_col, period_col, period,
+                                     line_item_label, flag_text, total_var,
+                                     share_reference_total, fmt_money, fmt_period_label=None):
+    """Per-segment component breakdown for one observation type/period.
+    component_df: a dataframe with dim_col and a "Variance ($)" column
+    (rollups.py's add_qoq_variance_generic() output, e.g. rev_region_var_q,
+    or a Category-level aggregate for the "Expenses" Total line item) --
+    NOT the plain revenue/expense rollup, which has no Variance ($) column.
+    period_col/period: select this period's rows from component_df.
+
+    total_var: this line item's OWN net variance (its own subtotal) --
+    displayed on the "Total Variance:" header line. For Revenue and for the
+    "Expenses" Total line item, this equals share_reference_total. For a
+    Category or Department row nested under Expenses, it does not -- e.g.
+    Software & Tools' own total_var is its own (possibly negative) subtotal,
+    even though every department beneath it is scored against Total
+    Expenses, not against Software & Tools' own subtotal.
+
+    share_reference_total: the denominator actually used for each segment's
+    % share AND for whether that segment counts as "driving" or
+    "offsetting" (same sign as this value = driving). Must be the exact
+    same value rollups.build_breadth_concentration() used as ref_total for
+    this line item/period (its grand_total_by_period argument, or its own
+    total_var when no override was given) -- share = row["Variance ($)"] /
+    abs(share_reference_total). Passing the wrong value here would silently
+    produce percentages that don't sum the way Section 3's own flag implies.
+
+    flag_text: must come verbatim from rollups.build_breadth_concentration()'s
+    own "Breadth/Concentration Flag" output for this exact period/
+    line_item_label -- inserted as the Assessment line, never independently
+    recomputed here (Brief Section 4: "Do not compute a second, separate
+    threshold check... the two must derive from one calculation, not two").
+
+    Segment order: the natural row order of component_df for this period
+    (whatever grouping/sort produced it upstream in rollups.py -- currently
+    alphabetical by dim_col, since rollups.py's groupby default-sorts).
+    This Brief's own worked example (Section 4) shows a non-alphabetical
+    order (North America, EMEA, APAC, LATAM), implying a specific,
+    business-defined "fixed segment list" order referenced in Section 0 --
+    but that fixed list was not found anywhere in the canonical checkout
+    either (same gap as the module-boundary note above). Using natural
+    dataframe order here as the best available default; flagged in the
+    Return Report for Architect confirmation of the intended order.
+
+    Does not add "favorable"/"unfavorable" wording anywhere (Brief Section
+    6, explicitly deferred/not authorized; reconfirmed by the Principal)."""
+    sub = component_df[component_df[period_col] == period].dropna(subset=["Variance ($)"])
+    display_period = fmt_period_label(period) if fmt_period_label else period
+
+    lines = [f"{line_item_label} — {display_period}", f"Total Variance: {fmt_money(total_var)}", "",
+              "Component Breakdown:"]
+    for _, row in sub.iterrows():
+        if share_reference_total == 0:
+            share_str = "N/A (no net movement)"
+        else:
+            share = row["Variance ($)"] / abs(share_reference_total)
+            share_str = f"{share:+.0%}"
+        lines.append(f"  {row[dim_col]}: {fmt_money(row['Variance ($)'])}  | {share_str}")
+
+    lines.append("")
+    lines.append(f"Assessment: {flag_text}")
+    return "\n".join(lines)

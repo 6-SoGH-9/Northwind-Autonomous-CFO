@@ -20,6 +20,43 @@ import pandas as pd
 import numpy as np
 
 import close_history
+# D17-BB-001, Section 4: commentary_workflow.py is where the Phase 7
+# movement-concentration component-detail generation lives per the Brief's
+# Section 8 file scope. commentary_workflow.py does not import rollups (a
+# pure-service module, confirmed by direct inspection), so this import
+# introduces no cycle in the normal dashboard/full-checkout case. This is
+# the one line in this file's import block that goes beyond Section 3's
+# build_breadth_concentration() change -- flagged explicitly in the Return
+# Report as a necessary wiring deviation, since the "original D17 package"
+# this Brief's Section 0/4 refer to for module-boundary precedent was not
+# found anywhere in this canonical checkout (no existing component-detail
+# code in commentary_workflow.py or northwind_narrative_prompt.md, and no
+# D17/D16 entries anywhere in project_handbook.md v2.19 at the commit this
+# Brief was implemented against).
+#
+# GUARDED, not a hard import (fixed after Principal-reported failure,
+# Round 1 patch): D15's "Run correction intake" candidate pipeline stages
+# and executes rollups.py standalone in an isolated temp directory
+# (observed: /tmp/d15_candidate_<id>/rollups.py) that does not co-locate
+# commentary_workflow.py alongside it -- a hard top-level import broke that
+# pipeline outright with ModuleNotFoundError, since Python has no reason to
+# find a sibling module that was never copied into the sandbox. That
+# candidate-pipeline run only needs rollups.py's deterministic Phase 2/3
+# tie-out logic; it never generates narrative. So rather than requiring
+# D15's sandbox-staging logic to change (period_lifecycle.py is explicitly
+# out of scope for this Brief -- not touched here), rollups.py degrades
+# gracefully instead: when commentary_workflow cannot be imported,
+# COMMENTARY_WORKFLOW is None and build_user_prompt() below falls back to
+# the pre-D17-BB-001 one-line-per-item breadth summary (its original,
+# always-worked behavior) instead of failing to import at all. In the
+# normal dashboard/full-checkout case (commentary_workflow.py present
+# alongside rollups.py, as it always is in this repository), the import
+# succeeds and every close gets full component detail, unaffected.
+try:
+    import commentary_workflow
+    COMMENTARY_WORKFLOW = commentary_workflow
+except ImportError:
+    COMMENTARY_WORKFLOW = None
 
 
 def find_raw_dataset():
@@ -589,8 +626,21 @@ def build_salaries_volume_rate(period_col, period_order, hc_df):
 sb_volrate_q = build_salaries_volume_rate("Fiscal Quarter", quarter_order, hc_by_dept_q)
 sb_volrate_y = build_salaries_volume_rate("Fiscal Year", year_order, hc_by_dept_y)
 
-# --- (b) Breadth/concentration for Revenue and other expense categories -----
-CONCENTRATION_THRESHOLD = 0.60  # >=60% of gross variance from one segment = "Concentrated"
+# --- (b) Breadth/concentration for Revenue and Expenses ---------------------
+# D17-BB-001, Section 3 + Principal correction (this session, superseding the
+# Architect's original Section 3 code on two points -- see the Return Report):
+#   (1) Gross variance is removed entirely -- net (signed) variance only,
+#       everywhere, no supplementary gross column.
+#   (2) The driver-vs-threshold check now uses abs(top_driver_share), fixing
+#       the sign-blind-concentration defect flagged in the prior round (a
+#       negative-net-variance period could never be flagged Concentrated
+#       under the literal original Section 3 code).
+# Sheet name (Breadth_Concentration_Q/_Y) and column name (Breadth/
+# Concentration Flag) are retained unchanged per Brief Section 0/6 (rename
+# explicitly deferred, not part of this change).
+CONCENTRATION_THRESHOLD = 0.60          # Revenue only (by Region / by Product Line) -- unchanged
+EXPENSE_CONCENTRATION_THRESHOLD = 0.17  # Expenses (Total / Category / Department) -- Principal-set, replaces 60% for this domain only
+OFFSET_MATERIALITY_THRESHOLD = 0.20     # shared by Revenue and Expenses, deliberately kept independent of either concentration threshold above (Principal instruction)
 
 
 def add_qoq_variance_generic(df, group_cols, value_col, period_col, period_order):
@@ -602,41 +652,67 @@ def add_qoq_variance_generic(df, group_cols, value_col, period_col, period_order
 
 
 def build_breadth_concentration(df, dim_col, period_col, period_order, line_item_label,
-                                 threshold=CONCENTRATION_THRESHOLD):
+                                 threshold=CONCENTRATION_THRESHOLD,
+                                 grand_total_by_period=None):
+    """grand_total_by_period: optional {period: net_total_var} mapping. When
+    given, EVERY period's share-of-net-variance denominator and driver-vs-
+    offsetting sign reference for this line item come from that external
+    total instead of summing `sub` -- used for Expenses' Category- and
+    Department-level rows, which the Principal confirmed must all reference
+    Total Expenses' own net variance (never a Category subtotal), at every
+    level. "Total Variance ($)" displayed for this line item is always its
+    OWN subtotal (own_total) regardless -- only the % share and the driver/
+    offsetting sign test are redirected to the external total. When absent
+    (the default), behaves exactly as before: both the displayed total and
+    the share/sign reference are `sub`'s own net sum -- used for Revenue,
+    and for the "Expenses" Total line item itself (where the grand total IS
+    the sum of its own segments, so no override is needed)."""
     rows = []
     for period in period_order:
         sub = df[df[period_col] == period].dropna(subset=["Variance ($)"])
         if sub.empty:
             continue
-        total_var = sub["Variance ($)"].sum()
-        gross_var = sub["Variance ($)"].abs().sum()
+        own_total = sub["Variance ($)"].sum()
+        ref_total = grand_total_by_period[period] if grand_total_by_period is not None else own_total
         n_segments = sub[dim_col].nunique()
-        if total_var > 0:
-            n_same_direction = int((sub["Variance ($)"] > 0).sum())
-        elif total_var < 0:
-            n_same_direction = int((sub["Variance ($)"] < 0).sum())
+
+        if ref_total == 0:
+            rows.append({
+                period_col: period, "Line Item": line_item_label,
+                "Total Variance ($)": own_total,
+                "Top Driver": None, "Top Driver Share of Net Variance": np.nan,
+                "Top Offsetting Segment": None, "Top Offsetting Share of Net Variance": np.nan,
+                "Breadth/Concentration Flag": "No net movement (flat period-over-period)",
+            })
+            continue
+
+        net_sign = 1 if ref_total > 0 else -1
+        drivers = sub[np.sign(sub["Variance ($)"]) == net_sign]
+        offsetters = sub[np.sign(sub["Variance ($)"]) == -net_sign]
+        n_drivers = len(drivers)
+
+        top_driver_row = drivers.loc[drivers["Variance ($)"].abs().idxmax()] if not drivers.empty else None
+        top_offset_row = offsetters.loc[offsetters["Variance ($)"].abs().idxmax()] if not offsetters.empty else None
+
+        top_driver = top_driver_row[dim_col] if top_driver_row is not None else None
+        top_driver_share = (top_driver_row["Variance ($)"] / abs(ref_total)) if top_driver_row is not None else np.nan
+        top_offset = top_offset_row[dim_col] if top_offset_row is not None else None
+        top_offset_share = (top_offset_row["Variance ($)"] / abs(ref_total)) if top_offset_row is not None else np.nan
+
+        if top_driver_row is not None and abs(top_driver_share) >= threshold:
+            flag = (f"Concentrated in {top_driver} ({top_driver_share:+.0%} of net variance, "
+                     f"threshold {threshold:.0%}), driving the net movement")
         else:
-            n_same_direction = 0
-        if gross_var == 0:
-            top_segment, top_share = None, np.nan
-            flag = "No variance (flat period-over-period)"
-        else:
-            top_row = sub.loc[sub["Variance ($)"].abs().idxmax()]
-            top_segment = top_row[dim_col]
-            top_share = abs(top_row["Variance ($)"]) / gross_var
-            if top_share >= threshold:
-                flag = f"Concentrated in {top_segment} ({top_share:.0%} of gross variance, threshold {threshold:.0%})"
-            else:
-                flag = f"Broad-based across {n_same_direction} of {n_segments} segments moving the same direction"
+            flag = f"Broad-based across {n_drivers} of {n_segments} segments driving the net movement"
+
+        if top_offset_row is not None and abs(top_offset_share) >= OFFSET_MATERIALITY_THRESHOLD:
+            flag += f"; substantially offset by {top_offset} ({top_offset_share:+.0%} of net variance)"
+
         rows.append({
-            period_col: period,
-            "Line Item": line_item_label,
-            "Total Variance ($)": total_var,
-            "Gross Variance ($)": gross_var,
-            "Segments Moving Same Direction": n_same_direction,
-            "Total Segments": n_segments,
-            "Top Contributor": top_segment,
-            "Top Contributor Share": top_share,
+            period_col: period, "Line Item": line_item_label,
+            "Total Variance ($)": own_total,
+            "Top Driver": top_driver, "Top Driver Share of Net Variance": top_driver_share,
+            "Top Offsetting Segment": top_offset, "Top Offsetting Share of Net Variance": top_offset_share,
             "Breadth/Concentration Flag": flag,
         })
     return pd.DataFrame(rows)
@@ -657,17 +733,90 @@ breadth_rev_product_q = build_breadth_concentration(rev_product_var_q, "Product 
 breadth_rev_region_y = build_breadth_concentration(rev_region_var_y, "Region", "Fiscal Year", year_order, "Revenue (by Region)")
 breadth_rev_product_y = build_breadth_concentration(rev_product_var_y, "Product Line", "Fiscal Year", year_order, "Revenue (by Product Line)")
 
-# Expense category breadth — Software & Tools and Other Opex, by department
-breadth_exp_frames_q = []
-breadth_exp_frames_y = []
-for cat in ["Software & Tools", "Other Opex"]:
+# Expenses breadth — Total Expenses, then each of its three Categories'
+# Department breakdown (Salaries & Benefits, Software & Tools, Other Opex).
+# Principal correction (this session, superseding the original D17-BB-001
+# Section 3 two-line-item design): every level -- the Total row, each
+# Category row (as a "segment" of the Total), and each Department row
+# (as a "segment" of its own Category) -- shares ONE denominator and ONE
+# sign reference: Total Expenses' own net variance. A Department's or
+# Category's "Total Variance ($)" displayed is still its own subtotal; only
+# its % share and its driver-vs-offsetting classification are computed
+# against the Total. This is not additive to the prior two-line-item
+# design -- it replaces it (Salaries & Benefits was previously entirely
+# absent from Breadth/Concentration; the two prior line items,
+# "Software & Tools (by Department)" and "Other Opex (by Department)", are
+# both re-based onto the grand total rather than each category's own
+# subtotal, and gain a sibling "Salaries & Benefits (by Department)").
+# D17-BB-001, Section 4: per-segment source frames (dim_col + Variance ($)
+# column, plus an optional grand-total share-reference lookup) for the four
+# observation types, keyed by the exact same line_item_label
+# build_breadth_concentration() uses, so Section 4's component detail and
+# Section 3's Breadth/Concentration Flag stay tied to the same period/
+# line-item identity. Value shape: (dim_col, component_df,
+# share_reference_by_period_or_None) -- None for Revenue and for the
+# "Expenses" Total line item, where the displayed total IS the share
+# denominator; a {period: total} dict for the three Category/Department
+# rows below, where it is not.
+MOVEMENT_COMPONENT_SOURCES_Q = {
+    "Revenue (by Region)": ("Region", rev_region_var_q, None),
+    "Revenue (by Product Line)": ("Product Line", rev_product_var_q, None),
+}
+MOVEMENT_COMPONENT_SOURCES_Y = {
+    "Revenue (by Region)": ("Region", rev_region_var_y, None),
+    "Revenue (by Product Line)": ("Product Line", rev_product_var_y, None),
+}
+
+EXPENSE_CATEGORIES = ["Salaries & Benefits", "Software & Tools", "Other Opex"]
+
+# Category-level totals (one row per Category per period) -- summed
+# independently from the raw Expenses data (not from the department-level
+# frames below) so the "Expenses" Total line item and its own tie-out check
+# do not depend on how the per-category frames happen to be constructed.
+exp_categories_q = expenses.groupby(["Category", "Fiscal Quarter"], as_index=False)["Amount ($)"].sum()
+exp_categories_q = add_qoq_variance_generic(exp_categories_q, ["Category"], "Amount ($)", "Fiscal Quarter", quarter_order)
+exp_categories_y = expenses.groupby(["Category", "Fiscal Year"], as_index=False)["Amount ($)"].sum()
+exp_categories_y = add_qoq_variance_generic(exp_categories_y, ["Category"], "Amount ($)", "Fiscal Year", year_order)
+
+# "Expenses" Total line item -- no override: its own segments (the three
+# Categories) sum to the grand total by construction, so this call is
+# ordinary build_breadth_concentration(), exactly like Revenue.
+breadth_expenses_total_q = build_breadth_concentration(
+    exp_categories_q, "Category", "Fiscal Quarter", quarter_order, "Expenses",
+    threshold=EXPENSE_CONCENTRATION_THRESHOLD,
+)
+breadth_expenses_total_y = build_breadth_concentration(
+    exp_categories_y, "Category", "Fiscal Year", year_order, "Expenses",
+    threshold=EXPENSE_CONCENTRATION_THRESHOLD,
+)
+MOVEMENT_COMPONENT_SOURCES_Q["Expenses"] = ("Category", exp_categories_q, None)
+MOVEMENT_COMPONENT_SOURCES_Y["Expenses"] = ("Category", exp_categories_y, None)
+
+# Grand-total-by-period lookups, read directly off the "Expenses" Total row
+# above (single source of truth -- guarantees the denominator used by every
+# Category/Department row below is exactly what's displayed as the Total
+# Expenses row, never independently recomputed and liable to drift).
+grand_total_expenses_by_period_q = dict(zip(breadth_expenses_total_q["Fiscal Quarter"], breadth_expenses_total_q["Total Variance ($)"]))
+grand_total_expenses_by_period_y = dict(zip(breadth_expenses_total_y["Fiscal Year"], breadth_expenses_total_y["Total Variance ($)"]))
+
+breadth_exp_frames_q = [breadth_expenses_total_q]
+breadth_exp_frames_y = [breadth_expenses_total_y]
+for cat in EXPENSE_CATEGORIES:
     cat_df_q = expenses[expenses["Category"] == cat].groupby(["Department", "Fiscal Quarter"], as_index=False)["Amount ($)"].sum()
     cat_df_q = add_qoq_variance_generic(cat_df_q, ["Department"], "Amount ($)", "Fiscal Quarter", quarter_order)
-    breadth_exp_frames_q.append(build_breadth_concentration(cat_df_q, "Department", "Fiscal Quarter", quarter_order, f"{cat} (by Department)"))
+    breadth_exp_frames_q.append(build_breadth_concentration(
+        cat_df_q, "Department", "Fiscal Quarter", quarter_order, f"{cat} (by Department)",
+        threshold=EXPENSE_CONCENTRATION_THRESHOLD, grand_total_by_period=grand_total_expenses_by_period_q,
+    ))
+    MOVEMENT_COMPONENT_SOURCES_Q[f"{cat} (by Department)"] = ("Department", cat_df_q, grand_total_expenses_by_period_q)
 
     cat_df_y = expenses[expenses["Category"] == cat].groupby(["Department", "Fiscal Year"], as_index=False)["Amount ($)"].sum()
     cat_df_y = add_qoq_variance_generic(cat_df_y, ["Department"], "Amount ($)", "Fiscal Year", year_order)
-    breadth_exp_frames_y.append(build_breadth_concentration(cat_df_y, "Department", "Fiscal Year", year_order, f"{cat} (by Department)"))
+    breadth_exp_frames_y.append(build_breadth_concentration(
+        cat_df_y, "Department", "Fiscal Year", year_order, f"{cat} (by Department)",
+        threshold=EXPENSE_CONCENTRATION_THRESHOLD, grand_total_by_period=grand_total_expenses_by_period_y,
+    ))
+    MOVEMENT_COMPONENT_SOURCES_Y[f"{cat} (by Department)"] = ("Department", cat_df_y, grand_total_expenses_by_period_y)
 
 breadth_all_q = pd.concat(
     [breadth_rev_region_q, breadth_rev_product_q] + breadth_exp_frames_q, ignore_index=True
@@ -814,6 +963,20 @@ if diff9.max() > 0.01:
 else:
     print(f"OK  Breadth/concentration total variance (Revenue by Region) ties to PL_Quarterly's Total Revenue QoQ variance (max diff ${diff9.max():.4f})")
 
+# 11l. Principal correction (this session): the new "Expenses" Total line
+# item's own net variance -- the shared denominator every Category and
+# Department row beneath it now references -- must independently tie to
+# pl_q's Total Opex QoQ/YoY variance, the same way Revenue by Region already
+# ties to Total Revenue variance above.
+breadth_expenses_check = breadth_expenses_total_q.set_index("Fiscal Quarter")["Total Variance ($)"]
+pl_opex_var_check = pl_q.set_index("Fiscal Quarter")["Total Opex QoQ/YoY Var ($)"]
+common_idx_exp = breadth_expenses_check.index.intersection(pl_opex_var_check.dropna().index)
+diff10 = (breadth_expenses_check.loc[common_idx_exp] - pl_opex_var_check.loc[common_idx_exp]).abs()
+if diff10.max() > 0.01:
+    errors.append(f"Breadth 'Expenses' total variance vs PL Total Opex variance mismatch: max diff {diff10.max():.2f}")
+else:
+    print(f"OK  Breadth/concentration 'Expenses' total variance ties to PL_Quarterly's Total Opex QoQ variance (max diff ${diff10.max():.4f})")
+
 print()
 if errors:
     print("ALL FAILURES (final):")
@@ -954,7 +1117,9 @@ print(region_gtm_pct_q[region_gtm_pct_q["Region"] == "North America"].to_string(
 print("\nSample — Salaries & Benefits Volume/Rate Bridge (Q2 FY2024, first quarter with a prior period):")
 print(sb_volrate_q[sb_volrate_q["Fiscal Quarter"] == "Q2 FY2024"].to_string(index=False))
 print("\nSample — Breadth/Concentration, Revenue by Region (all quarters):")
-print(breadth_rev_region_q[["Fiscal Quarter", "Total Variance ($)", "Top Contributor", "Top Contributor Share", "Breadth/Concentration Flag"]].to_string(index=False))
+print(breadth_rev_region_q[["Fiscal Quarter", "Total Variance ($)", "Top Driver", "Top Driver Share of Net Variance",
+                            "Top Offsetting Segment", "Top Offsetting Share of Net Variance",
+                            "Breadth/Concentration Flag"]].to_string(index=False))
 print("\nSample — Department x Cost Type Investigation View, Q2 FY2024 (first quarter with a prior period):")
 print(exp_by_dept_cat_q[exp_by_dept_cat_q["Fiscal Quarter"] == "Q2 FY2024"].to_string(index=False))
 print("\nSample — Cost Category-only (company-wide) view, Q2 FY2024 (first quarter with a prior period):")
@@ -1104,6 +1269,7 @@ Rules:
 2. The volume/rate decomposition (for Salaries & Benefits) and the breadth/concentration measure (for revenue and other expense categories) are provided to you pre-calculated in the input data. Narrate these finished figures — do not attempt to calculate or infer a volume/rate split yourself from raw totals. If the input data doesn't include a decomposition for a given line, say so rather than guessing at one.
 2b. Never use "Gross Profit" or "Gross Margin" — this dataset has no COGS line. Use "Operating Profit" and "Operating Margin" throughout.
 2c. The region view ("Net of GTM Cost") and product line view ("Net of R&D Cost") are investment-proportionality measures, not profitability or margin measures — they show whether go-to-market spend (region) or R&D spend (product line) is growing in proportion to revenue, nothing more. The input data provides these as $ figures only (Revenue, Allocated cost, Net-of-allocated-cost) per segment for the current period, plus a separate single-segment % trend series when one is given to you. NEVER state or imply a profitability or efficiency ranking between segments from either the $ figures or the % trend — a larger Net-of-cost $ figure reflects a larger segment, not better unit economics, and the % trend for one segment says nothing about any other segment's %, because no other segment's % is ever provided to you in the same context. If you are given a % trend for a single segment, narrate it only as that segment's own investment-proportionality trend over time (e.g. "North America's go-to-market cost has held at approximately X% of its own revenue for three consecutive quarters"). The Region cut and the Product cut are NEVER comparable to each other (different cost bases subtracted by design) — do not compare a region's figures to a product line's figures.
+2d. The Breadth/Concentration measure covers Revenue (by Region, by Product Line — each its own line item, its own total, 60% concentration threshold) and Expenses (a three-level hierarchy: Total Expenses, then each of its three Categories — Salaries & Benefits, Software & Tools, Other Opex — then each Category's own Departments; every Expenses level shares ONE denominator, Total Expenses' own net variance, for both its % share and its driving-vs-offsetting classification, at a 17% concentration threshold). No gross-variance figure is used anywhere in this measure. Each line item includes a per-segment Component Breakdown (each segment's own signed $ variance and its share of the shared net-variance denominator) beneath its own Assessment line. Narrate every Assessment line and every component figure exactly as given — do not recompute any concentration threshold, do not re-derive which segment is "driving" vs "offsetting" the movement, and never add "favorable"/"unfavorable" wording, since no such directionality rule is supplied in the input data.
 3. Lead with the most material item first, not chronologically or alphabetically. Materiality = largest absolute dollar variance or largest percentage swing, whichever a board member would ask about first.
 4. One sentence per material finding. No hedging language ("it appears," "seems to suggest," "could potentially"). State the finding, then the evidence, in the same sentence or the next.
 5. No filler, no motivational framing, no phrases like "exciting growth" or "strong momentum" unless the data specifically supports the magnitude of that claim.
@@ -1128,7 +1294,19 @@ def fmt_pct(x):
 def build_user_prompt(period_col, period_order, current_period, prior_period, comparison_label,
                        pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
                        exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
-                       accepted_commentary_lines=None, commentary_narrative_block=None):
+                       accepted_commentary_lines=None, commentary_narrative_block=None,
+                       movement_component_sources=None):
+    # movement_component_sources (D17-BB-001, Section 4): dict of
+    # {line_item_label: (dim_col, dataframe-with-"Variance ($)")}, matching
+    # breadth_df's cadence (Quarterly -> MOVEMENT_COMPONENT_SOURCES_Q,
+    # Annual -> MOVEMENT_COMPONENT_SOURCES_Y). Optional, default None,
+    # following this function's existing pattern for every other addition
+    # (accepted_commentary_lines, commentary_narrative_block) -- preserves
+    # byte-identical output for any caller not yet updated to pass it. Both
+    # call sites in this project (the __main__ demo below and the
+    # dashboard) are updated to pass it, so in practice every close renders
+    # component detail per Brief Section 10's "every close, no
+    # conditionals" criterion.
     pl_row = pl_df[pl_df[period_col] == current_period].iloc[0]
     pl_prior_row = pl_df[pl_df[period_col] == prior_period].iloc[0] if prior_period in pl_df[period_col].values else None
 
@@ -1193,9 +1371,33 @@ def build_user_prompt(period_col, period_order, current_period, prior_period, co
             f"Volume effect {fmt_money(r['Volume Effect ($)'])}, Rate effect {fmt_money(r['Rate Effect ($)'])}, total variance {fmt_money(r['Actual Variance ($)'])}"
         )
 
+    # D17-BB-001, Section 4: per-segment component-breakdown detail, all four
+    # observation types, no conditional logic. When movement_component_sources
+    # is supplied AND commentary_workflow was importable (COMMENTARY_WORKFLOW
+    # is not None -- see the guarded import above), render
+    # COMMENTARY_WORKFLOW.build_movement_component_detail() per line item
+    # (byte-identical Assessment line to Section 3's own flag, reused
+    # verbatim -- never independently regenerated). Otherwise (a caller that
+    # predates this parameter, OR a standalone/sandboxed execution of this
+    # file without commentary_workflow.py co-located -- e.g. D15's
+    # correction-intake candidate pipeline), fall back to the pre-existing
+    # single-line-per-item summary, unchanged, for backward compatibility.
     breadth_lines = []
     for _, r in breadth_df[breadth_df[period_col] == current_period].iterrows():
-        breadth_lines.append(f"  - {r['Line Item']}: total variance {fmt_money(r['Total Variance ($)'])} — {r['Breadth/Concentration Flag']}")
+        line_item = r["Line Item"]
+        source = movement_component_sources.get(line_item) if movement_component_sources else None
+        if source is not None and COMMENTARY_WORKFLOW is not None:
+            dim_col, component_df, share_ref_by_period = source
+            share_reference_total = (
+                share_ref_by_period[current_period] if share_ref_by_period is not None else r["Total Variance ($)"]
+            )
+            breadth_lines.append(COMMENTARY_WORKFLOW.build_movement_component_detail(
+                component_df, dim_col, period_col, current_period, line_item,
+                r["Breadth/Concentration Flag"], r["Total Variance ($)"], share_reference_total, fmt_money,
+                fmt_period_label=fmt_period_label,
+            ))
+        else:
+            breadth_lines.append(f"  - {r['Line Item']}: total variance {fmt_money(r['Total Variance ($)'])} — {r['Breadth/Concentration Flag']}")
 
     hc_lines = []
     for _, r in hc_dept_df[hc_dept_df[period_col] == current_period].iterrows():
@@ -1275,9 +1477,9 @@ Salaries & Benefits — Volume/Rate Decomposition (pre-calculated, per departmen
 {chr(10).join(sb_lines)}
 (Volume effect = change in headcount x prior period cost-per-head. Rate effect = new headcount x change in cost-per-head. Calculated upstream — narrate, do not recompute.)
 
-Revenue and Other Expense Categories — Breadth/Concentration (pre-calculated):
+Revenue and Expenses — Breadth/Concentration, with per-segment Component Breakdown (pre-calculated, D17-BB-001):
 {chr(10).join(breadth_lines)}
-(Not a volume/rate split — measures whether a variance is systemic or localized. Threshold: a single segment carrying >=60% of gross variance is "Concentrated"; otherwise "Broad-based".)
+(Not a volume/rate split — measures whether a variance is systemic/broad-based or concentrated in one segment, on a NET (signed), not gross, basis; no gross-variance figure appears anywhere below. Revenue lines (by Region, by Product Line) use their own total and a 60% concentration threshold. Expenses lines (Total Expenses, then each Category, then each Category's Departments) all share ONE denominator — Total Expenses' own net variance — for both their % share and their driving-vs-offsetting classification, at a 17% concentration threshold; a Department's or Category's own "Total Variance" line is still its own subtotal, only its % and classification reference the shared total. An opposing segment carrying >=20% of net variance is flagged as substantially offsetting, for both Revenue and Expenses. Do not add "favorable"/"unfavorable" wording anywhere in this section.)
 
 Headcount:
 {chr(10).join(hc_lines)}
@@ -1351,6 +1553,7 @@ if __name__ == "__main__":
         DEMO_PERIOD_COL, quarter_order, DEMO_CURRENT, DEMO_PRIOR, DEMO_PRIOR,
         pl_q, rev_by_region_q, rev_by_product_q, region_cm_q, product_cm_q,
         exp_by_dept_q, sb_volrate_q, breadth_all_q, hc_dept_q, company_rev_per_hc_q, bva_q,
+        movement_component_sources=MOVEMENT_COMPONENT_SOURCES_Q,
     )
 
     print("\n" + "=" * 70)

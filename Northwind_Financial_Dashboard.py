@@ -112,8 +112,13 @@ def style_breadth_df(df):
     decided per row from the Line Item label rather than a fixed column rule."""
     fmt_map = {
         "Total Variance ($)": "${:,.0f}",
-        "Gross Variance ($)": "${:,.0f}",
-        "Top Contributor Share": fmt_pct_half,
+        # D17-BB-001, Section 3 required companion edit: "Top Contributor
+        # Share" no longer exists (schema change, not additive -- see
+        # Return Report) -- replaced by these two signed-percentage columns.
+        # "Gross Variance ($)" is removed entirely (Principal correction,
+        # this session) -- net (signed) variance only, no gross column.
+        "Top Driver Share of Net Variance": fmt_pct_half,
+        "Top Offsetting Share of Net Variance": fmt_pct_half,
     }
     styler = df.style.format(fmt_map, na_rep="")
 
@@ -181,6 +186,9 @@ if cadence == "Quarterly":
     region_cm_df, product_cm_df = R.region_cm_q, R.product_cm_q
     region_pct_df, product_pct_df = R.region_gtm_pct_q, R.product_rd_pct_q
     exp_dept_df, sb_df, breadth_df = R.exp_by_dept_q, R.sb_volrate_q, R.breadth_all_q
+    # D17-BB-001, Section 4: per-segment source frames matching breadth_df's
+    # cadence, for the Phase 7 movement-concentration component detail.
+    movement_component_sources = R.MOVEMENT_COMPONENT_SOURCES_Q
     hc_dept_df, company_rev_df, bva_df = R.hc_dept_q, R.company_rev_per_hc_q, R.bva_q
     opex_per_emp_df = R.opex_per_employee_q
     # Cost Structure Investigation View Brief (2026-08-09): Department x
@@ -197,6 +205,7 @@ else:
     region_cm_df, product_cm_df = R.region_cm_y, R.product_cm_y
     region_pct_df, product_pct_df = R.region_gtm_pct_y, R.product_rd_pct_y
     exp_dept_df, sb_df, breadth_df = R.exp_by_dept_y, R.sb_volrate_y, R.breadth_all_y
+    movement_component_sources = R.MOVEMENT_COMPONENT_SOURCES_Y
     hc_dept_df, company_rev_df, bva_df = R.hc_dept_y, R.company_rev_per_hc_y, R.bva_y
     opex_per_emp_df = R.opex_per_employee_y
     exp_dept_cat_df = R.exp_by_dept_cat_y
@@ -426,7 +435,13 @@ with tab_exp:
     if cadence == "Quarterly":
         breadth_display[period_col] = breadth_display[period_col].map(R.fmt_period_label)
     st.dataframe(style_breadth_df(breadth_display), use_container_width=True)
-    st.caption("Threshold: a single segment carrying >=60% of gross variance is flagged Concentrated; otherwise Broad-based.")
+    st.caption(
+        "Threshold: for Revenue rows, a single segment driving >=60% of net (signed) variance is flagged "
+        "Concentrated; for Expenses rows (Total / Category / Department, all sharing Total Expenses' own "
+        "net variance as denominator and sign reference), the threshold is >=17%. An opposing segment "
+        "carrying >=20% of net variance is flagged as substantially offsetting, for both. No gross-variance "
+        "figure is used anywhere in this table (Principal correction, D17-BB-001)."
+    )
 
     st.subheader(f"Opex per Employee by Department — {R.fmt_period_label(current_period)}")
     st.caption(
@@ -1602,6 +1617,7 @@ with tab_narr:
         pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
         exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
         commentary_narrative_block=_commentary_block,
+        movement_component_sources=movement_component_sources,
     )
 
     with st.expander("View rendered prompt (data sent to the model)"):

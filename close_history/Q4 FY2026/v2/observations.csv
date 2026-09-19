@@ -1,0 +1,4 @@
+Observation ID,Detected By,Period,Type,Department,Category,Before ($),After ($),Delta ($),Threshold Crossed
+OBS-362846a64c,Phase 2 (Deterministic Validation),Jan 2026,Historical Revision,Sales & Marketing,Salaries & Benefits,165873.54,199048.248,33174.707999999984,
+OBS-d3fc630e0d,Phase 2 (Deterministic Validation),Jun 2026,Historical Revision,G&A,Other Opex,25045.57,1025045.57,1000000.0,
+OBS-40533c2aa8,Phase 3 (Plausibility Review),Q4 2026,Plausibility Anomaly,G&A,Other Opex,75157.76,1075752.45,1000594.69,|QoQ %| > 25%
