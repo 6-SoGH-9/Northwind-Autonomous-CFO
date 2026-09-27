@@ -2,7 +2,8 @@
 Northwind AI in Finance Challenge — Step 1: Data Layer
 Builds quarter and year rollups from the raw monthly tables (Revenue, Expenses,
 Headcount, Budget_vs_Actual), with QoQ and YoY variance, and verifies tie-out
-against PL_Summary and Budget_vs_Actual.
+against Budget_vs_Actual. (PL_Summary is a hardcoded, unverified reference
+sheet, not a tie-out target -- see build_pl_rollup()'s source-of-truth note.)
 
 Fiscal year convention: FY runs July-June (matches the dataset's Jul 2023-Jun 2026
 span exactly = 3 complete fiscal years, no partial year). FY label = the calendar
@@ -128,9 +129,29 @@ revenue = pd.read_excel(xl, "Revenue")
 expenses = pd.read_excel(xl, "Expenses")
 headcount = pd.read_excel(xl, "Headcount")
 bva = pd.read_excel(xl, "Budget_vs_Actual")
-pl_summary = pd.read_excel(xl, "PL_Summary")
-pl_summary = pl_summary[pl_summary["Date"] != "Total / Avg"].copy()
-pl_summary["Date"] = pd.to_datetime(pl_summary["Date"])
+# PL_Summary source-of-truth fix (this session): build_pl_rollup() below no
+# longer reads pl_summary at all -- Total Revenue ($)/Total Opex ($) are now
+# computed from the Revenue/Expenses transactional sheets directly, since
+# PL_Summary is a hardcoded, unverified reference sheet supplied by
+# Controlling, not a computed or trustworthy source. This load is kept
+# (per Architect instruction, not removed outright) so the workbook's
+# PL_Summary sheet -- when present -- is still parsed the same way as
+# before. Confirmed by direct execution that this load, unguarded, crashes
+# the entire pipeline (ValueError: Worksheet named 'PL_Summary' not found)
+# the moment a dataset lacks that sheet -- which Bug/Change 6's upload
+# review (period_lifecycle.py) now permits, since PL_Summary was removed
+# from DATASET_REQUIRED_SHEETS in this same change. Flagged for Architect
+# review rather than silently decided: wrapped in try/except so a missing
+# sheet degrades to an empty frame instead of halting the pipeline, since
+# nothing downstream reads pl_summary any longer.
+try:
+    pl_summary = pd.read_excel(xl, "PL_Summary")
+    pl_summary = pl_summary[pl_summary["Date"] != "Total / Avg"].copy()
+    pl_summary["Date"] = pd.to_datetime(pl_summary["Date"])
+except ValueError:
+    pl_summary = pd.DataFrame(columns=[
+        "Date", "Total Revenue ($)", "Total Opex ($)", "Gross Profit ($)", "Gross Margin (%)",
+    ])
 
 
 def add_fiscal_cols(df, date_col="Date"):
@@ -369,16 +390,26 @@ bva_y = build_bva_rollup("Fiscal Year")
 
 # ---------------------------------------------------------------------------
 # 7. PL rollups (Revenue, Opex, Operating Profit, Operating Margin)
-#    Renamed from PL_Summary's "Gross Profit/Margin" per project convention:
-#    no COGS line in this dataset, so use Operating Profit / Operating Margin.
+#    Source-of-truth fix (this session): Total Revenue ($) and Total Opex ($)
+#    are computed directly from the Revenue/Expenses transactional sheets --
+#    the same monthly data every other rollup in this file sums from -- using
+#    the identical groupby/sum already used for the equivalent tie-out check
+#    below, rather than from PL_Summary. PL_Summary is a hardcoded, unverified
+#    reference sheet supplied by Controlling for reference only; it is not a
+#    computed or trustworthy source, so it is no longer read here. Operating
+#    Profit/Operating Margin are derived from these two exactly as before --
+#    no change to that arithmetic. (Naming note carried over from the prior
+#    PL_Summary-sourced version: no COGS line in this dataset, so this project
+#    uses Operating Profit / Operating Margin rather than Gross Profit/Margin.)
 # ---------------------------------------------------------------------------
-pl_summary = pl_summary.rename(columns={
-    "Gross Profit ($)": "Operating Profit ($)",
-    "Gross Margin (%)": "Operating Margin (%)",
-})
-
 def build_pl_rollup(period_col):
-    g = pl_summary.groupby(period_col, as_index=False)[["Total Revenue ($)", "Total Opex ($)"]].sum()
+    rev_g = revenue.groupby(period_col, as_index=False)["Revenue ($)"].sum().rename(
+        columns={"Revenue ($)": "Total Revenue ($)"}
+    )
+    exp_g = expenses.groupby(period_col, as_index=False)["Amount ($)"].sum().rename(
+        columns={"Amount ($)": "Total Opex ($)"}
+    )
+    g = rev_g.merge(exp_g, on=period_col, how="outer")
     g["Operating Profit ($)"] = g["Total Revenue ($)"] - g["Total Opex ($)"]
     g["Operating Margin (%)"] = g["Operating Profit ($)"] / g["Total Revenue ($)"]
     return g
@@ -826,7 +857,7 @@ breadth_all_y = pd.concat(
 )
 
 # ---------------------------------------------------------------------------
-# 11. VERIFY: rollups must tie out exactly to PL_Summary / raw totals
+# 11. VERIFY: rollups must tie out exactly to each other / raw totals
 # ---------------------------------------------------------------------------
 print("=" * 70)
 print("VERIFICATION")
@@ -834,14 +865,13 @@ print("=" * 70)
 
 errors = []
 
-# 8a. Revenue rollup totals vs PL_Summary Total Revenue, by quarter
+# 8a. PL_Summary tie-out check REMOVED (this session): pl_q's Total Revenue
+# ($) is now itself computed from this same revenue.groupby(...).sum() (see
+# build_pl_rollup() above), so a check comparing the two would only ever
+# compare this rollup to itself -- there is nothing independent left to
+# verify since PL_Summary is no longer the source. rev_q_total is kept: 8e
+# below still uses it to tie out Budget_vs_Actual's Revenue actuals.
 rev_q_total = revenue.groupby("Fiscal Quarter")["Revenue ($)"].sum()
-pl_rev_q = pl_q.set_index("Fiscal Quarter")["Total Revenue ($)"]
-diff = (rev_q_total - pl_rev_q).abs()
-if diff.max() > 0.01:
-    errors.append(f"Revenue quarterly rollup vs PL_Summary mismatch: max diff {diff.max():.2f}")
-else:
-    print(f"OK  Revenue (by region/product, summed) ties to PL_Summary Total Revenue by quarter (max diff ${diff.max():.4f})")
 
 # 8b. Region rollup sums to same total as product-line rollup, per quarter
 region_q_total = rev_by_region_q.groupby("Fiscal Quarter")["Revenue ($)"].sum()
@@ -852,23 +882,13 @@ if diff2.max() > 0.01:
 else:
     print(f"OK  Revenue by Region and by Product Line tie to each other, per quarter (max diff ${diff2.max():.4f})")
 
-# 8c. Expense rollup totals vs PL_Summary Total Opex, by quarter
-exp_q_total = expenses.groupby("Fiscal Quarter")["Amount ($)"].sum()
-pl_opex_q = pl_q.set_index("Fiscal Quarter")["Total Opex ($)"]
-diff3 = (exp_q_total - pl_opex_q).abs()
-if diff3.max() > 0.01:
-    errors.append(f"Expense quarterly rollup vs PL_Summary mismatch: max diff {diff3.max():.2f}")
-else:
-    print(f"OK  Expenses (by department, summed) tie to PL_Summary Total Opex by quarter (max diff ${diff3.max():.4f})")
+# 8c. PL_Summary tie-out check REMOVED (this session): same reasoning as 8a
+# -- pl_q's Total Opex ($) is now itself computed from this same
+# expenses.groupby(...).sum() (see build_pl_rollup() above).
 
-# 8d. Annual rollups tie to sum of their own quarters
-rev_y_check = revenue.groupby("Fiscal Year")["Revenue ($)"].sum()
-pl_rev_y = pl_y.set_index("Fiscal Year")["Total Revenue ($)"]
-diff4 = (rev_y_check - pl_rev_y).abs()
-if diff4.max() > 0.01:
-    errors.append(f"Revenue annual rollup vs PL_Summary mismatch: max diff {diff4.max():.2f}")
-else:
-    print(f"OK  Revenue annual rollup ties to PL_Summary Total Revenue by fiscal year (max diff ${diff4.max():.4f})")
+# 8d. PL_Summary tie-out check REMOVED (this session): same reasoning as 8a,
+# for the annual rollup (pl_y's Total Revenue ($) is now computed from this
+# same revenue.groupby("Fiscal Year") sum).
 
 # 8e. BvA rollup Actual vs raw Revenue actuals, per quarter (Line Item == 'Revenue')
 bva_rev_q = bva_q[bva_q["Line Item"] == "Revenue"].set_index("Fiscal Quarter")["Actual ($)"]
@@ -1029,8 +1049,10 @@ else:
 #
 # Criterion 13: exp_by_cat_q's grand total (summed across all Categories),
 # per period, must equal exp_by_dept_q's total for that period -- i.e. the
-# SAME Department-level expense total already tied out under Criterion 1 /
-# check 8c above (which itself already ties to PL_Summary Total Opex).
+# SAME Department-level expense total already computed as exp_q_total
+# (formerly tied out to PL_Summary Total Opex under check 8c, removed
+# this session since pl_q's Total Opex is now sourced from this same
+# Expenses data -- see build_pl_rollup()'s source-of-truth note).
 # ---------------------------------------------------------------------------
 cat_from_dept_cat_q = exp_by_dept_cat_q.groupby(["Category", "Fiscal Quarter"])["Amount ($)"].sum()
 cat_only_q = exp_by_cat_q.set_index(["Category", "Fiscal Quarter"])["Amount ($)"]

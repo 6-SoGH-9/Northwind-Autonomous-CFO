@@ -276,6 +276,7 @@ def _resolve_target_period(period_col, period_order, target_period, data):
 def run_phase3_plausibility_review(
     expenses,
     headcount,
+    revenue=None,
     period_col="Fiscal Quarter",
     period_order=None,
     target_period=None,
@@ -303,6 +304,24 @@ def run_phase3_plausibility_review(
         Must contain [Department, period_col, "Headcount"] (or a
         pre-aggregated average per period -- if raw monthly rows are
         passed, they are averaged per Department x period_col here).
+    revenue : pd.DataFrame or None
+        Optional (OI-10 / D15-Item2-Corrections Brief, Item C). Must
+        contain [Region, "Product Line", period_col, "Revenue ($)"] when
+        supplied. When None (the default -- every pre-existing caller is
+        unaffected with zero code change), Phase 3 covers Expenses/
+        Headcount only, exactly as before this parameter was added. When
+        supplied, Phase 3 additionally flags QoQ swings at company-wide
+        Total Revenue and at the Region and Product Line grain (the same
+        grains already produced independently as Rev_by_Region_Q /
+        Rev_by_Product_Q -- no new grain invented), at the SAME
+        `qoq_threshold` already governing Expenses (Principal-confirmed:
+        25%, i.e. DEFAULT_PLAUSIBILITY_QOQ_THRESHOLD, reused unchanged --
+        no separate revenue-specific threshold). Revenue flags are never
+        gated on headcount (that linkage is Expenses-specific); a
+        flagged revenue row's "Headcount Change" is NaN and its "Driver"
+        follows the same qoq_threshold-only test. Appended into the same
+        flagged_rows/all_cells frames, same column shape, so existing
+        rendering code needs no change.
     period_col : str
         Name of the period column shared by both inputs.
     period_order : sequence or None
@@ -320,6 +339,7 @@ def run_phase3_plausibility_review(
         pipeline).
     qoq_threshold : float
         See module-level DEFAULT_PLAUSIBILITY_QOQ_THRESHOLD for rationale.
+        Also governs revenue flags when `revenue` is supplied (see above).
     headcount_band : int
         See module-level DEFAULT_PLAUSIBILITY_HEADCOUNT_BAND for rationale.
 
@@ -415,6 +435,72 @@ def run_phase3_plausibility_review(
     out_cols = ["Department", "Category", period_col, "Prior ($)", "Amount ($)",
                 "QoQ (%)", "Headcount Change", "Driver"]
     all_cells = merged[out_cols].reset_index(drop=True)
+
+    # --- Revenue coverage (OI-10 / D15-Item2-Corrections Brief, Item C) ---
+    # Additive only: when revenue is None, rev_cells stays empty and
+    # all_cells/flagged are unaffected -- byte-identical to pre-Item-C
+    # behavior for every existing caller that doesn't pass `revenue`.
+    if revenue is not None:
+        required_rev_cols = {"Region", "Product Line", period_col, "Revenue ($)"}
+        missing_rev = required_rev_cols - set(revenue.columns)
+        if missing_rev:
+            raise ValueError(f"Phase 3 revenue input missing required columns: {sorted(missing_rev)}")
+
+        def _rev_qoq_cells(group_col, label_prefix):
+            g = revenue.groupby([group_col, period_col], as_index=False)["Revenue ($)"].sum()
+            g["_ord"] = g[period_col].map(order_map)
+            g = g.sort_values([group_col, "_ord"])
+            g["Prior ($)"] = g.groupby(group_col)["Revenue ($)"].shift(1)
+            g["_prior_ord"] = g.groupby(group_col)["_ord"].shift(1)
+            cells = g[(g["_ord"] == target_ord) & (g["_prior_ord"] == target_ord - 1)].copy()
+            if cells.empty:
+                return pd.DataFrame(columns=["Department", "Category", period_col, "Prior ($)", "Amount ($)"])
+            cells["QoQ (%)"] = np.where(
+                cells["Prior ($)"].notna() & (cells["Prior ($)"] != 0),
+                (cells["Revenue ($)"] - cells["Prior ($)"]) / cells["Prior ($)"],
+                np.nan,
+            )
+            cells = cells.rename(columns={"Revenue ($)": "Amount ($)"})
+            cells["Department"] = label_prefix + cells[group_col].astype(str)
+            cells["Category"] = "Revenue"
+            return cells[["Department", "Category", period_col, "Prior ($)", "Amount ($)", "QoQ (%)"]]
+
+        # Company-wide Total Revenue.
+        total = revenue.groupby(period_col, as_index=False)["Revenue ($)"].sum()
+        total["_ord"] = total[period_col].map(order_map)
+        total = total.sort_values("_ord")
+        total["Prior ($)"] = total["Revenue ($)"].shift(1)
+        total["_prior_ord"] = total["_ord"].shift(1)
+        total_cell = total[(total["_ord"] == target_ord) & (total["_prior_ord"] == target_ord - 1)].copy()
+        if not total_cell.empty:
+            total_cell["QoQ (%)"] = np.where(
+                total_cell["Prior ($)"].notna() & (total_cell["Prior ($)"] != 0),
+                (total_cell["Revenue ($)"] - total_cell["Prior ($)"]) / total_cell["Prior ($)"],
+                np.nan,
+            )
+            total_cell = total_cell.rename(columns={"Revenue ($)": "Amount ($)"})
+            total_cell["Department"] = "Company-Wide"
+            total_cell["Category"] = "Total Revenue"
+            total_cell = total_cell[["Department", "Category", period_col, "Prior ($)", "Amount ($)", "QoQ (%)"]]
+        else:
+            total_cell = pd.DataFrame(columns=["Department", "Category", period_col, "Prior ($)", "Amount ($)", "QoQ (%)"])
+
+        region_cells = _rev_qoq_cells("Region", "Region: ")
+        product_cells = _rev_qoq_cells("Product Line", "Product Line: ")
+        if "QoQ (%)" not in region_cells.columns:
+            region_cells["QoQ (%)"] = pd.Series(dtype=float)
+        if "QoQ (%)" not in product_cells.columns:
+            product_cells["QoQ (%)"] = pd.Series(dtype=float)
+
+        rev_cells = pd.concat([total_cell, region_cells, product_cells], ignore_index=True)
+        if len(rev_cells) > 0:
+            rev_cells["Headcount Change"] = np.nan
+            rev_cells["Driver"] = ""
+            rev_flag_condition = rev_cells["QoQ (%)"].abs() > qoq_threshold
+            rev_cells.loc[rev_flag_condition, "Driver"] = DRIVER_NOT_IDENTIFIABLE
+            rev_cells = rev_cells[out_cols]
+            all_cells = pd.concat([all_cells, rev_cells], ignore_index=True)
+
     flagged = all_cells[all_cells["Driver"] == DRIVER_NOT_IDENTIFIABLE].reset_index(drop=True)
 
     return Phase3Result(
