@@ -12,6 +12,7 @@ period" button instead — download the .txt file and paste it into a Claude
 chat to get the narrative manually.
 """
 
+import io
 import os
 import shutil
 import importlib
@@ -136,6 +137,48 @@ def _find_unresolved_reopen_period():
     if st.session_state.get("reopen_step", 0) in (1, 2, 3):
         return st.session_state.get("reopen_target_period")
     return None
+
+
+def _commentary_record_from_dict(d):
+    """Inverse of CommentaryRecord.to_dict() (the writer used by
+    CWF.serialize_commentary_records() when a close is archived). Rebuilds the
+    complete record -- every version, its validation result, the accepted-version
+    marker and the match audit fields -- from a Close History snapshot."""
+    rec = CWF.CommentaryRecord(
+        observation_id=d["observation_id"],
+        accepted_version_number=d.get("accepted_version_number"),
+        match_method=d.get("match_method"),
+        match_basis=d.get("match_basis"),
+    )
+    for v in d.get("versions", []):
+        vr = v.get("validation_result")
+        rec.versions.append(CWF.CommentaryVersion(
+            version_number=v["version_number"], text=v["text"], source=v["source"],
+            submitted_by=v["submitted_by"], timestamp=v["timestamp"],
+            validation_result=CWF.Phase6Result(**vr) if vr is not None else None,
+        ))
+    return rec
+
+
+def _archived_commentary_for_period(period_label):
+    """Read-back of a CLOSED quarter's observation register and Commentary Record
+    from its latest approved Close History snapshot (D10: the immutable record of
+    what was approved). Returns (register_df, records_by_observation_id,
+    commentary_file_supplied) or None when the period has no saved close.
+    Raises if a saved snapshot exists but cannot be read -- the caller reports
+    that; it is never silently treated as 'no commentary'.
+
+    commentary_file_supplied is derived from the snapshot itself: a non-empty
+    Commentary Record means a commentary file was supplied and matched at least
+    one observation. (A file supplied but matched to nothing leaves no record, so
+    it cannot be told apart from no file at all -- see Return Report.)"""
+    close = close_history.resolve_latest_approved_close_for_period(period_label)
+    if close is None:
+        return None
+    register = pd.read_csv(close["observations_path"])
+    raw_records = close["metadata"].get("commentary_record") or {}
+    records = {oid: _commentary_record_from_dict(d) for oid, d in raw_records.items()}
+    return register, records, bool(records)
 
 
 def _narrative_gate_block(scope_quarters):
@@ -359,7 +402,9 @@ def _render_commentary_review_records(commentary_records, observation_register, 
         st.info(f"{len(open_uncommented)} open observation(s) have no matching commentary yet.")
         _display_open_uncommented = open_uncommented.copy()
         _display_open_uncommented["Period"] = _display_open_uncommented["Period"].apply(R.fmt_period_label)
-        st.dataframe(_display_open_uncommented, use_container_width=True)
+        # Fix: same $-formatting as every other currency table (was raw floats,
+        # e.g. 133623.893); fmt_display_df is the existing shared formatter.
+        st.dataframe(fmt_display_df(_display_open_uncommented), use_container_width=True)
 
     if not commentary_records:
         if open_uncommented.empty:
@@ -465,7 +510,7 @@ def _render_commentary_intake_and_review(commentary_records, observation_registe
                                          uploader_key, semantic_attempted,
                                          close_approval_getter, close_approval_setter,
                                          uploader_label="Commentary.xlsx (optional)",
-                                         on_file_supplied=None):
+                                         on_file_supplied=None, carried_file=None):
     """Bug/Change 4. The Commentary Review (Phase 4-6) import + review
     experience, factored out of the not-yet-closed close workflow so the
     reopen-a-closed-period candidate runs EXACTLY the same code, not a
@@ -504,6 +549,13 @@ def _render_commentary_intake_and_review(commentary_records, observation_registe
         return CWF.validate_commentary(text, evidence)
 
     uploaded = st.file_uploader(uploader_label, type=["xlsx"], key=uploader_key)
+    # Fix (commentary had to be uploaded twice): `carried_file` is (name, bytes)
+    # of a commentary file that was attached when "Run correction intake" reset
+    # the uploader. It is processed through the identical pipeline below, so the
+    # commentary is re-matched against the rebuilt candidate instead of lost.
+    # A file attached in the uploader always takes precedence.
+    if uploaded is None and carried_file is not None:
+        uploaded = io.BytesIO(carried_file[1])
     if uploaded is not None:
         if on_file_supplied is not None:
             on_file_supplied()
@@ -2095,6 +2147,22 @@ with tab_close:
                         _carried_commentary_records = {}
                         _carried_semantic_attempted = set()
 
+                    # Fix: keep a commentary file that is attached at the moment
+                    # of intake. The uploader is cleared by this very click
+                    # (Addendum 2 G1) and a file attached BEFORE intake was only
+                    # ever matched against the OLD candidate -- often one with
+                    # no observations -- so it was silently lost. A file carried
+                    # by the prior candidate for the same period is kept too.
+                    _attached_commentary = st.session_state.get(
+                        f"candidate_commentary_uploader_{st.session_state.get('reopen_uploader_generation', 0)}"
+                    )
+                    if _attached_commentary is not None:
+                        _carried_commentary_file = (_attached_commentary.name, _attached_commentary.getvalue())
+                    elif _existing_cand is not None and _existing_cand.get("period") == _rp:
+                        _carried_commentary_file = _existing_cand.get("carried_commentary_file")
+                    else:
+                        _carried_commentary_file = None
+
                     st.session_state["reopen_candidate"] = {
                         "period": _rp,
                         "numerical_impact": _numerical_impact,
@@ -2121,6 +2189,7 @@ with tab_close:
                         # state, so a rerun never re-calls semantic
                         # reconciliation for a commentary already tried.
                         "semantic_attempted": _carried_semantic_attempted,
+                        "carried_commentary_file": _carried_commentary_file,
                         # Principal-directed fix (live-testing session):
                         # (name, size) of the uploaded file this candidate
                         # was actually built from, or None when it was
@@ -2563,6 +2632,7 @@ with tab_close:
                     close_approval_getter=_candidate_approval_status_for,
                     close_approval_setter=_set_candidate_approval_status_for,
                     uploader_label="Commentary.xlsx for this candidate (optional)",
+                    carried_file=_cand.get("carried_commentary_file"),
                 )
 
                 st.divider()
@@ -2870,6 +2940,9 @@ with tab_close:
                         # deliberately left to "Start over" below, not
                         # folded in here.
                         st.session_state["reopen_candidate_approval_status"] = "rejected"
+                        _rejected_cand = st.session_state.get("reopen_candidate")
+                        if _rejected_cand is not None:
+                            _rejected_cand["carried_commentary_file"] = None
                         # Item G (Addendum 2): reset both reopen uploaders.
                         st.session_state["reopen_uploader_generation"] = (
                             st.session_state.get("reopen_uploader_generation", 0) + 1
@@ -2981,10 +3054,45 @@ with tab_narr:
     # prompt text is CFO/Board-facing (IA #9) and must use the same D14
     # display-format convention as every other user-facing surface. Reuses
     # the existing R.fmt_period_label formatter -- no second implementation.
+    # Fix (commentary lost before/without download): for a CLOSED quarter the
+    # register and the Commentary Record are read back from that period's own
+    # latest approved Close History snapshot, not from session memory -- so the
+    # narrative prompt is identical whether it is viewed right after approval,
+    # after a page refresh, or days later in a new session. Unclosed periods,
+    # and Annual cadence, keep the existing session-based path unchanged.
+    _narr_register = observation_register
+    _narr_records = st.session_state.get("commentary_records", {})
+    _narr_file_supplied = st.session_state.get("commentary_file_supplied", False)
+    if cadence == "Quarterly":
+        try:
+            _archived_commentary = _archived_commentary_for_period(current_period)
+        except Exception as _archive_read_exc:
+            _archived_commentary = None
+            st.warning(
+                f"The archived commentary for {R.fmt_period_label(current_period)} could not be read "
+                f"({type(_archive_read_exc).__name__}: {_archive_read_exc}). The prompt below is built from "
+                f"this session only and may be missing commentary."
+            )
+        if _archived_commentary is not None:
+            _narr_register, _narr_records, _narr_file_supplied = _archived_commentary
+    # Fix (cross-period leak): when the register comes from this session, it is
+    # the one built for the Close Validation tab's own period selector, which can
+    # differ from the sidebar period this prompt is about. Keep only observations
+    # belonging to the period(s) the prompt covers, so a flag from another
+    # period is never attributed to this narrative.
+    if _narr_register is observation_register and not observation_register.empty:
+        _narr_scope_labels = {
+            R.fmt_period_label(_q)
+            for _q in (
+                [current_period] if cadence == "Quarterly"
+                else [q for q in R.quarter_order if q.endswith(" " + str(current_period))]
+            )
+        }
+        _narr_register = observation_register[observation_register["Period"].isin(_narr_scope_labels)]
     _commentary_block = CWF.build_narrative_commentary_section(
-        observation_register,
-        st.session_state.get("commentary_records", {}),
-        st.session_state.get("commentary_file_supplied", False),
+        _narr_register,
+        _narr_records,
+        _narr_file_supplied,
         fmt_period_label=R.fmt_period_label,
     )
     user_prompt = R.build_user_prompt(
