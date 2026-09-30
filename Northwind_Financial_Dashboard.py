@@ -93,6 +93,63 @@ def _set_close_approval_status_for(period_label, status):
     st.session_state.setdefault("close_approval_status_by_period", {})[period_label] = status
 
 
+def _fmt_close_order_block_message(blocker, target_period):
+    """D15 Items 3 & 4 — renders PL.find_close_order_blocker()'s raw
+    result into the exact wording the Brief specifies (Message Wording
+    section), applying R.fmt_period_label to every placeholder. The one
+    and only place this module builds these two message templates, so
+    all three call sites (the 5.B selection early warning and both
+    Approve handlers' hard blocks) render identical text for the same
+    underlying block."""
+    blocking = R.fmt_period_label(blocker["blocking_period"])
+    target = R.fmt_period_label(target_period)
+    if blocker["reason"] == "never_closed":
+        return f"{blocking} is still open. Close it before closing {target}."
+    predecessor = R.fmt_period_label(blocker["predecessor"])
+    return (
+        f"Reopen and close {blocking} before closing {target}. "
+        f"Reopening {predecessor} affected its QoQ."
+    )
+
+
+def _find_unresolved_reopen_period():
+    """Principal-directed extension (post-D15-Items-3&4 delivery, live-
+    testing finding): a reopen that has been requested and/or confirmed
+    (Step 1/2/3) but neither Approved nor abandoned via "Start over" must
+    block Approve-close attempts on any OTHER period, and must block a
+    second reopen from being started, until it is resolved.
+
+    The dashboard tracks at most one in-progress reopen at a time -- a
+    single session-state slot (`reopen_step` / `reopen_target_period`),
+    not one per period -- so at most one period can ever be "still
+    reopened" at once under the current design; this can never return
+    more than one period, and "the oldest of multiple" is therefore
+    moot as long as that remains true. Returns the pending period's
+    label, or None if no reopen is currently in progress.
+    """
+    if st.session_state.get("reopen_step", 0) in (1, 2, 3):
+        return st.session_state.get("reopen_target_period")
+    return None
+
+
+def _fmt_unresolved_reopen_block_message(pending_period, action_period, action_verb="closing"):
+    """Companion to _fmt_close_order_block_message() above, for the
+    separate (non-D15-Brief-scope) unresolved-reopen block. Kept as its
+    own message/template rather than folded into
+    PL.find_close_order_blocker(), since this check is session-state
+    (in-progress UI state), not Close History state -- it has nothing to
+    do with period_lifecycle.py's pure, close-history-only logic.
+    `action_verb` covers both call shapes: blocking an Approve-close
+    attempt ("closing") and blocking a second reopen from starting
+    ("reopening")."""
+    pending = R.fmt_period_label(pending_period)
+    action = R.fmt_period_label(action_period)
+    return (
+        f"{pending} is still reopened — its reopen has not yet been approved or cancelled. "
+        f"Resolve it (approve the candidate close, or \"Start over\") before {action_verb} {action}."
+    )
+
+
 def render_phase2_flagged_table(flagged_rows):
     """Item D (D15-Item2-Corrections Brief): the exact Phase 2 flagged-row
     rendering already used by the Close Validation Status tab's own
@@ -107,6 +164,95 @@ def render_phase2_flagged_table(flagged_rows):
     )
     st.dataframe(display.style.format({"Prior Close ($)": "${:,.2f}", "Current Close ($)": "${:,.2f}", "Diff ($)": "${:,.2f}"}),
                  use_container_width=True)
+
+
+# Principal-directed fix ("budget should also be integrated"): Phase 2
+# (Deterministic Validation) previously only ever checked the Expenses
+# sheet. This generalizes it to Revenue, Headcount, and Budget_vs_Actual
+# too, reusing close_validation.run_phase2_deterministic_validation()
+# unchanged (it is already fully generic over key_cols/value_col -- no
+# change to close_validation.py was needed). Kept ADDITIVE to, and
+# separate from, the existing Expenses-based `phase2_result` used
+# throughout the rest of this tab (Gap 4 flag count, archive_close's
+# phase2_flag_count, the reopen candidate pipeline, and
+# commentary_workflow.build_observation_register(), which is Expenses-
+# schema-specific and Verified/not being reopened here -- see its own
+# docstring). These extended results are surfaced as their own dedicated
+# section below and folded additively into "any_flags_found" / the
+# Workflow State strip, but are NOT (yet) matched against Controller
+# commentary the way Phase 2/3's existing Expenses/Headcount/Revenue-QoQ
+# flags are -- flagged as an Architect review item in the Return Report,
+# not silently decided here.
+_EXTENDED_PHASE2_SHEET_SPECS = [
+    ("Revenue", ("Date", "Region", "Product Line"), "Revenue ($)"),
+    ("Headcount", ("Date", "Department"), "Headcount"),
+    ("Budget_vs_Actual (Budget $)", ("Date", "Line Item"), "Budget ($)"),
+    ("Budget_vs_Actual (Actual $)", ("Date", "Line Item"), "Actual ($)"),
+]
+
+
+def _run_extended_phase2_coverage(current_revenue, prior_revenue, current_headcount, prior_headcount,
+                                   current_bva, prior_bva):
+    """Runs CV.run_phase2_deterministic_validation() for Revenue, Headcount,
+    and Budget_vs_Actual (both its Budget ($) and Actual ($) value columns),
+    against the SAME per-period prior-approved-close baseline the caller
+    already resolved for Expenses. Returns an ordered dict of
+    {label: Phase2Result}, in the order _EXTENDED_PHASE2_SHEET_SPECS
+    defines, so rendering is deterministic.
+    """
+    current_by_sheet = {
+        "Revenue": current_revenue,
+        "Headcount": current_headcount,
+        "Budget_vs_Actual (Budget $)": current_bva,
+        "Budget_vs_Actual (Actual $)": current_bva,
+    }
+    prior_by_sheet = {
+        "Revenue": prior_revenue,
+        "Headcount": prior_headcount,
+        "Budget_vs_Actual (Budget $)": prior_bva,
+        "Budget_vs_Actual (Actual $)": prior_bva,
+    }
+    results = {}
+    for label, key_cols, value_col in _EXTENDED_PHASE2_SHEET_SPECS:
+        results[label] = CV.run_phase2_deterministic_validation(
+            current_data=current_by_sheet[label],
+            prior_data=prior_by_sheet[label],
+            key_cols=key_cols,
+            value_col=value_col,
+        )
+    return results
+
+
+def _render_extended_phase2_coverage(extended_results):
+    """Renders _run_extended_phase2_coverage()'s results as one small table
+    per sheet, mirroring render_phase2_flagged_table()'s style but generic
+    over whatever key_cols that sheet used (Revenue/Headcount/
+    Budget_vs_Actual each have a different key shape than Expenses).
+    """
+    any_ran = any(r.status == CV.STATUS_OK for r in extended_results.values())
+    if not any_ran:
+        st.info(
+            "**Not applicable** — no prior approved close exists yet for this period to diff any of "
+            "Revenue, Headcount, or Budget vs Actual against."
+        )
+        return
+    for label, result in extended_results.items():
+        if result.status != CV.STATUS_OK:
+            continue
+        if len(result.flagged_rows) == 0:
+            continue
+        st.markdown(f"**{label}** — {len(result.flagged_rows)} row(s) changed vs. this period's latest approved close")
+        value_col = [c for c in result.flagged_rows.columns if c.endswith("_current")][0][: -len("_current")]
+        display_cols = [c for c in result.flagged_rows.columns if c not in (f"{value_col}_prior", f"{value_col}_current", "Diff ($)")]
+        display = result.flagged_rows[display_cols + [f"{value_col}_prior", f"{value_col}_current", "Diff ($)"]].rename(
+            columns={f"{value_col}_prior": "Prior Close", f"{value_col}_current": "Current Close"}
+        )
+        st.dataframe(
+            display.style.format({"Prior Close": "${:,.2f}", "Current Close": "${:,.2f}", "Diff ($)": "${:,.2f}"}),
+            use_container_width=True,
+        )
+    if all(r.status == CV.STATUS_OK and len(r.flagged_rows) == 0 for r in extended_results.values() if r.status == CV.STATUS_OK):
+        st.success("No differences found against the latest approved close for Revenue, Headcount, or Budget vs Actual.")
 
 
 def _render_commentary_review_records(commentary_records, observation_register, target_period,
@@ -132,10 +278,27 @@ def _render_commentary_review_records(commentary_records, observation_register, 
          Specific enough?) is never rendered here. Version History and
          everything else the expander showed before remains.
     """
-    if not commentary_records:
-        st.caption("No commentary imported yet this session.")
-        return
-
+    # Principal-directed fix (live-testing session): this "open observation(s)
+    # have no matching commentary yet" notice is the ONLY thing in this
+    # dashboard that tells the user "something needs your attention" for an
+    # observation nobody has commented on yet -- e.g. a reopen-candidate's
+    # newly-flagged observation that appeared only after a correction, with
+    # zero commentary imported for THIS candidate yet. It must render
+    # whenever there are open observations, independent of whether
+    # commentary_records happens to be empty.
+    #
+    # Previously, an early `if not commentary_records: ...; return` sat
+    # ABOVE this notice's computation, so it never ran at all whenever
+    # commentary_records was completely empty -- which is exactly the state
+    # of a freshly-built reopen candidate before any commentary has been
+    # uploaded for it. Confirmed live: a corrected Q2 2026 candidate with a
+    # genuinely new Phase 3 flag (R&D/Software & Tools) showed only "No
+    # commentary imported yet this session" -- no indication a new
+    # observation existed at all -- and the close was approved with that
+    # observation never offered a chance for commentary. The open-
+    # uncommented notice only appeared afterward, on the closed/read-only
+    # view, forcing a second reopen just to add the commentary that should
+    # have been offered the first time.
     commented_ids = set(commentary_records.keys())
     open_uncommented = (
         observation_register[~observation_register["Observation ID"].isin(commented_ids)]
@@ -146,6 +309,15 @@ def _render_commentary_review_records(commentary_records, observation_register, 
         _display_open_uncommented = open_uncommented.copy()
         _display_open_uncommented["Period"] = _display_open_uncommented["Period"].apply(R.fmt_period_label)
         st.dataframe(_display_open_uncommented, use_container_width=True)
+
+    if not commentary_records:
+        if open_uncommented.empty:
+            # Nothing flagged this period (or -- read-only historical view --
+            # every observation that WAS flagged already has commentary
+            # recorded elsewhere) and nothing imported: genuinely nothing to
+            # review, not a state that needs a "no commentary" caption.
+            st.caption("No commentary imported yet this session.")
+        return
 
     for oid, record in commentary_records.items():
         obs_matches = observation_register[observation_register["Observation ID"] == oid]
@@ -961,6 +1133,17 @@ with tab_close:
     # own internal Gate check below.
     _target_period_closed_info = close_history.resolve_latest_approved_close_for_period(target_period)
 
+    # D15 Items 3 & 4 -- early warning only (informational; the
+    # authoritative, hard-blocking re-check runs again inside both Approve
+    # handlers below, immediately before archive_close(), since the two
+    # checks can observe different Close History states if time passes
+    # between selection and Approve). Procedural only: never sets, clears,
+    # or implies Workflow State, Executive Ready, or any other Human
+    # Approval Gate (D13) criterion -- this is a caption, nothing else.
+    _close_order_blocker = PL.find_close_order_blocker(target_period, R.quarter_order, close_history)
+    if _close_order_blocker is not None:
+        st.warning(_fmt_close_order_block_message(_close_order_blocker, target_period))
+
     st.caption(
         f"This tab validates, generates observations for, and (on approval) archives "
         f"**{R.fmt_period_label(target_period)}** — the period selected above, not the sidebar's "
@@ -970,16 +1153,33 @@ with tab_close:
         "register, Commentary Review, or which period gets archived here."
     )
 
-    # --- Resolve the latest APPROVED close from real Close History, and run
-    # close_validation.py's production Phase 2/3 functions against it. This
-    # is the module swap for Cycle 3 Task 2: no import of, and no data from,
-    # close_v1_v2_simulation.py anywhere in this tab. Phase 2 compares the
-    # currently-loaded close (R.expenses) against the latest approved close
-    # in Close History (None if Close History is empty — the real Live
-    # state today, per Handbook Section 7: "Live's own Close History starts
-    # empty"). Phase 3 evaluates the currently-loaded close's own quarterly
-    # history and needs no prior approved close to run.
-    resolved_prior_close = close_history.resolve_latest_approved_close()
+    # --- Resolve the TARGET PERIOD's own latest approved close from real
+    # Close History, and run close_validation.py's production Phase 2/3
+    # functions against it. This is the module swap for Cycle 3 Task 2: no
+    # import of, and no data from, close_v1_v2_simulation.py anywhere in
+    # this tab. Phase 2 compares the currently-loaded close (R.expenses)
+    # against the prior approved state (None if this period has never been
+    # closed before -- the real Live state today, per Handbook Section 7:
+    # "Live's own Close History starts empty"). Phase 3 evaluates the
+    # currently-loaded close's own quarterly history and needs no prior
+    # approved close to run.
+    #
+    # Principal-directed fix (aligned in session: "the intake must only
+    # affect the period which is reopened" / two-tier sourcing): this call
+    # previously used close_history.resolve_latest_approved_close() -- the
+    # GLOBAL latest approved close by approval timestamp across every
+    # period in Close History, not this period's own prior state. That is
+    # the exact same defect class already fixed for Executive Ready above
+    # (see the D15 Item 2 correction 3 comment) and for the reopen
+    # candidate's own Phase 2 call (_run_candidate_pipeline, "this period's
+    # OWN prior approved close, never the global latest") -- it was simply
+    # never applied to this call site. Using the global latest meant
+    # approving an unrelated period's close (or a reopened HISTORICAL
+    # period's v2) could silently swap in the wrong baseline here,
+    # producing a Phase 2 diff against a period that has nothing to do with
+    # target_period. resolve_latest_approved_close_for_period(target_period)
+    # is the correct, already-established fix for this shape of bug.
+    resolved_prior_close = close_history.resolve_latest_approved_close_for_period(target_period)
     prior_expenses_df = None
     if resolved_prior_close is not None:
         prior_expenses_df = pd.read_excel(resolved_prior_close["raw_dataset_path"], "Expenses")
@@ -990,6 +1190,37 @@ with tab_close:
         prior_data=prior_expenses_df,
         key_cols=("Date", "Department", "Category"),
         value_col="Amount ($)",
+    )
+
+    # Extended Phase 2 coverage (Principal-directed: "budget should also be
+    # integrated"), additive only -- Revenue, Headcount, and
+    # Budget_vs_Actual, using the SAME per-period baseline
+    # (resolved_prior_close, now correctly period-scoped above) instead of
+    # the Expenses-only check that previously existed. Kept entirely
+    # separate from `phase2_result` (which stays Expenses-only, unchanged
+    # in shape) rather than merged into it, because build_observation_register()
+    # and every existing consumer of phase2_result (Gap 4 flag count,
+    # archive_close's phase2_flag_count, the reopen candidate pipeline) are
+    # written against Expenses' own column shape (Department/Category) --
+    # Revenue (Region/Product Line) and Budget_vs_Actual (Line Item) don't
+    # fit that shape, and build_observation_register's Phase 2 branch is a
+    # Verified, already-investigated piece of the system (see its own
+    # "Observation Register Period Semantics" docstring) not being reopened
+    # here. See _run_extended_phase2_coverage() below and its own docstring
+    # for the full rationale and what is/isn't wired into Commentary Review.
+    prior_revenue_df = prior_headcount_df = prior_bva_df = None
+    if resolved_prior_close is not None:
+        prior_revenue_df = pd.read_excel(resolved_prior_close["raw_dataset_path"], "Revenue")
+        prior_revenue_df["Date"] = pd.to_datetime(prior_revenue_df["Date"])
+        prior_headcount_df = pd.read_excel(resolved_prior_close["raw_dataset_path"], "Headcount")
+        prior_headcount_df["Date"] = pd.to_datetime(prior_headcount_df["Date"])
+        prior_bva_df = pd.read_excel(resolved_prior_close["raw_dataset_path"], "Budget_vs_Actual")
+        prior_bva_df["Date"] = pd.to_datetime(prior_bva_df["Date"])
+
+    extended_phase2_results = _run_extended_phase2_coverage(
+        current_revenue=R.revenue, prior_revenue=prior_revenue_df,
+        current_headcount=R.headcount, prior_headcount=prior_headcount_df,
+        current_bva=R.bva, prior_bva=prior_bva_df,
     )
     phase3_result = CV.run_phase3_plausibility_review(
         expenses=R.expenses,
@@ -1025,9 +1256,22 @@ with tab_close:
 
     st.subheader("Workflow state")
     phase2_ran = phase2_result.status == CV.STATUS_OK
-    any_flags_found = (phase2_ran and len(phase2_result.flagged_rows) > 0) or (
-        phase3_result.status == CV.STATUS_OK and len(phase3_result.flagged_rows) > 0
+    any_extended_phase2_flags = any(
+        r.status == CV.STATUS_OK and len(r.flagged_rows) > 0 for r in extended_phase2_results.values()
     )
+    # Principal directive (2026-09-29): Phase 2 findings -- both the base
+    # Expenses check above and the extended Revenue/Headcount/Budget vs
+    # Actual coverage -- no longer generate Observation IDs or enter the
+    # Commentary Review register (see build_observation_register()'s
+    # docstring). A Phase 2 row is a raw-data diff against the prior
+    # approved close, not something a Controller can narrate. "Awaiting
+    # Controller Input" must track only what the Commentary Review section
+    # can actually act on, so no Phase 2 flag count (base or extended)
+    # feeds it here; phase2_ran/phase2_result.flagged_rows and
+    # extended_phase2_results remain fully reported elsewhere (Workflow
+    # state's "Data Validated" caption and the dedicated Phase 2 sections
+    # below) unchanged.
+    any_flags_found = phase3_result.status == CV.STATUS_OK and len(phase3_result.flagged_rows) > 0
 
     # Human Approval Gate (Brief human_approval_gate_brief_v1.md), Section
     # B.4: the two rows below must reflect real computed state, not the
@@ -1133,6 +1377,15 @@ with tab_close:
             st.success("No differences found against the latest approved close.")
         else:
             st.warning(f"{len(phase2_result.flagged_rows)} row(s) changed vs. the latest approved close — see table above.")
+
+    st.markdown("**Phase 2 — extended coverage: Revenue / Headcount / Budget vs Actual**")
+    st.caption(
+        "Same deterministic diff as above, extended to Revenue, Headcount, and Budget vs Actual "
+        "(Principal-directed: previously Expenses-only). Compared against this same period's own prior "
+        "approved close. Not yet matched against Controller commentary in the observation register below "
+        "(Architect review item — see Return Report); shown here for visibility."
+    )
+    _render_extended_phase2_coverage(extended_phase2_results)
 
     st.divider()
     st.subheader(f"Phase 3 — Plausibility Review (current close, {R.fmt_period_label(phase3_result.target_period) or 'latest period'} only)")
@@ -1405,6 +1658,29 @@ with tab_close:
                         len(phase3_result.flagged_rows) if phase3_result.status == CV.STATUS_OK else 0
                     )
                     _gap4_prior_close = close_history.resolve_latest_approved_close()
+                    # D15 Items 3 & 4 -- hard, authoritative close-order /
+                    # reopen-propagation check, immediately before
+                    # archive_close() runs (the 5.B selection control above
+                    # is only an early warning; this is the re-check the
+                    # Brief requires at Approve time). Procedural only --
+                    # _set_close_approval_status_for above is untouched by
+                    # this check, and nothing below sets, clears, or
+                    # implies any Human Approval Gate (D13) criterion.
+                    _close_order_blocker = PL.find_close_order_blocker(_gap4_period_label, R.quarter_order, close_history)
+                    if _close_order_blocker is not None:
+                        st.error(_fmt_close_order_block_message(_close_order_blocker, _gap4_period_label))
+                        st.stop()
+                    # Principal-directed extension: an unresolved reopen (Step
+                    # 1/2/3, not yet Approved or Started over) anywhere blocks
+                    # Approve-close everywhere else, until it's resolved --
+                    # checked here, hard, immediately before archive_close(),
+                    # same as the close-order check above. Independent of
+                    # _close_order_blocker: this is session in-progress-UI
+                    # state, not Close History state.
+                    _unresolved_reopen = _find_unresolved_reopen_period()
+                    if _unresolved_reopen is not None:
+                        st.error(_fmt_unresolved_reopen_block_message(_unresolved_reopen, _gap4_period_label))
+                        st.stop()
                     try:
                         close_history.archive_close(
                             period_label=_gap4_period_label,
@@ -1431,6 +1707,12 @@ with tab_close:
                         )
                         st.session_state["last_archived_close_period"] = _gap4_period_label
                         st.session_state["last_archive_error"] = None
+                        # D15 Items 3 & 4 -- bootstrap rule: a no-op unless
+                        # this is genuinely the very first close ever under
+                        # this rule (close_history/_baseline.json absent),
+                        # in which case this close's own period becomes the
+                        # permanent baseline, written exactly once.
+                        close_history.establish_close_order_baseline_if_absent(_gap4_period_label)
                         # Item B (D15-Item2-Corrections Brief, OI-9/OI-12): force
                         # rollups.py to re-resolve before the next render, so
                         # Close Validation Status/Phase 2/3 and every other tab
@@ -1527,7 +1809,32 @@ with tab_close:
         if "reopen_target_period" not in st.session_state:
             st.session_state["reopen_target_period"] = None
 
-        if st.session_state["reopen_step"] == 0:
+        # Principal-directed extension: the state machine below
+        # (reopen_step / reopen_target_period) is a single, global slot --
+        # not one per period. Before this guard, switching the "Select
+        # period" control to a DIFFERENT already-closed period while a
+        # reopen was still in progress (Step 1/2/3, not yet Approved or
+        # Started over) kept rendering that OTHER, unrelated period's
+        # Step 1/2/3 content here -- because the branches below key
+        # entirely off reopen_target_period, never off target_period. This
+        # guard makes the in-progress period authoritative for what
+        # renders: any other closed period shows a block notice (and
+        # cannot start its own reopen) instead of stale/mismatched Step
+        # 1/2/3 content, until the in-progress one is resolved.
+        _reopen_pending_elsewhere = (
+            st.session_state["reopen_step"] in (1, 2, 3)
+            and st.session_state["reopen_target_period"] is not None
+            and st.session_state["reopen_target_period"] != target_period
+        )
+
+        if _reopen_pending_elsewhere:
+            st.error(
+                _fmt_unresolved_reopen_block_message(
+                    st.session_state["reopen_target_period"], target_period, action_verb="reopening"
+                )
+            )
+
+        elif st.session_state["reopen_step"] == 0:
             if st.button("Request reopen", key="reopen_request_btn"):
                 st.session_state["reopen_step"] = 1
                 st.session_state["reopen_target_period"] = target_period
@@ -1619,7 +1926,7 @@ with tab_close:
             # -----------------------------------------------------------
             import tempfile as _tempfile
 
-            def _run_candidate_pipeline(_scoped_raw_path, _violations, _cleanup_dirs):
+            def _run_candidate_pipeline(_scoped_raw_path, _violations, _cleanup_dirs, source_file_id=None):
                 """Shared by both the no-conflict-immediate path and the
                 post-Continue path (Addendum 1, Item A) so the candidate-
                 build logic exists in exactly one place. `_violations` is
@@ -1749,6 +2056,17 @@ with tab_close:
                         # state, so a rerun never re-calls semantic
                         # reconciliation for a commentary already tried.
                         "semantic_attempted": _carried_semantic_attempted,
+                        # Principal-directed fix (live-testing session):
+                        # (name, size) of the uploaded file this candidate
+                        # was actually built from, or None when it was
+                        # built from the saved/approved dataset (no file
+                        # attached at build time, or a commentary-only
+                        # correction). Compared against whatever file
+                        # currently sits in the uploader by the Approve
+                        # handler below, so an unprocessed or since-
+                        # replaced attachment can never be silently
+                        # approved as if it were this candidate.
+                        "source_file_id": source_file_id,
                     }
                     # A newly (re)computed candidate always starts
                     # undecided -- never inherits a stale
@@ -1808,6 +2126,19 @@ with tab_close:
                 type=["xlsx"],
                 key=f"reopen_corrected_dataset_upload_{_uploader_gen}",
             )
+            # Principal-directed fix (live-testing session), identity of
+            # whatever file currently sits in the uploader -- used below
+            # both to build the candidate (when "Run correction intake" is
+            # actually clicked) and, separately, to detect a STALE
+            # candidate that does not reflect this file (see the Approve
+            # handler's own guard further down). (name, size) is a cheap,
+            # good-enough fingerprint -- this only needs to distinguish
+            # "same attachment as when the candidate was built" from
+            # "something has changed since," not cryptographically
+            # verify content.
+            _current_upload_id = (
+                (_corrected_file.name, _corrected_file.size) if _corrected_file is not None else None
+            )
 
             # Addendum 1, Item A (REVISED): a pending out-of-period
             # conflict, surfaced but not yet resolved by the user via
@@ -1857,13 +2188,48 @@ with tab_close:
             # dataset back to the saved one (Start over does that,
             # explicitly).
             _existing_cand_for_build = st.session_state.get("reopen_candidate")
+            # Principal-directed fix (live-testing session): a file
+            # currently attached in the uploader must NEVER be silently
+            # skipped by the auto-build below. Before this fix,
+            # _auto_build_now fired the moment no candidate existed yet
+            # for this period -- including on the very rerun that
+            # attaching a file itself triggers, before the user has had
+            # any chance to click "Run correction intake." Auto-build
+            # always sources the SAVED/approved dataset, never the
+            # uploader's contents, so that race silently built a candidate
+            # from the unchanged saved data, discarding the just-attached
+            # file -- with only a build-summary banner
+            # ("numerical_impact = False") as a hint, easy to miss. If the
+            # user then clicked "Approve candidate close," the pre-existing
+            # zero-net-change guard (Item F) saw no genuine change and
+            # auto-cancelled the whole reopen -- so the file was discarded
+            # and the reopen abandoned, with nothing in the UI clearly
+            # explaining either. Requiring `_corrected_file is None` here
+            # means: with a file attached, no candidate is auto-built at
+            # all -- the user must explicitly click "Run correction
+            # intake" (already shown right below, unconditionally, once a
+            # file is attached) before any candidate -- and therefore
+            # before "Approve candidate close" -- can appear. Removing the
+            # attached file (uploader's own "X") restores the prior
+            # auto-build-from-saved-data behavior for a commentary-only
+            # correction, unchanged.
             _auto_build_now = (
                 not _scope_pending_here
+                and _corrected_file is None
                 and (_existing_cand_for_build is None or _existing_cand_for_build.get("period") != _rp)
                 and not st.session_state.get("reopen_candidate_build_error")
             )
             _run_intake_clicked = False
             if not _scope_pending_here and _corrected_file is not None and _upload_check.ok:
+                # Principal-directed fix, paired with the _auto_build_now
+                # change above: make explicit, every render a file sits
+                # here unprocessed, that nothing has been done with it
+                # yet -- rather than leaving the button as the only signal.
+                st.info(
+                    f"**{_corrected_file.name}** is attached but has not been applied yet. Click "
+                    "**Run correction intake** below to build the candidate from it -- until then, "
+                    "no candidate exists for this reopen and nothing can be approved."
+                )
                 _run_intake_clicked = st.button("Run correction intake", key="reopen_run_correction_btn")
             # The auto-build never reads the uploader: it always uses the
             # saved dataset. A click always uses the attached file.
@@ -1931,11 +2297,25 @@ with tab_close:
                                         "scope_out_dir": _scope_out_dir,
                                         "tmp_dir": _tmp_dir,
                                         "violations": _violations,
+                                        # Principal-directed fix: captured now,
+                                        # at detection time, rather than
+                                        # re-derived from the uploader when
+                                        # "Continue" is eventually clicked --
+                                        # this out-of-period-violation path is
+                                        # only ever reached via an uploaded
+                                        # file (the saved-dataset-copy path is
+                                        # trivially identical to itself, so it
+                                        # can never produce a violation), so
+                                        # this is always non-None here.
+                                        "source_file_id": _current_upload_id,
                                     }
                                     st.rerun()
                                 else:
                                     with st.spinner("Regenerating candidate outputs against the corrected dataset..."):
-                                        _run_candidate_pipeline(_scoped_raw_path, [], [_tmp_dir, _scope_out_dir])
+                                        _run_candidate_pipeline(
+                                            _scoped_raw_path, [], [_tmp_dir, _scope_out_dir],
+                                            source_file_id=(_current_upload_id if _run_intake_clicked else None),
+                                        )
                                     # A failed build stores its error and returns without
                                     # a rerun; rerun so the error is actually shown.
                                     if st.session_state.get("reopen_candidate_build_error"):
@@ -1961,6 +2341,7 @@ with tab_close:
                             _run_candidate_pipeline(
                                 _pv["scoped_raw_path"], _pv["violations"],
                                 [_pv["tmp_dir"], _pv["scope_out_dir"]],
+                                source_file_id=_pv.get("source_file_id"),
                             )
                         st.session_state.pop("correction_scope_pending", None)
                 with _sc2:
@@ -2011,6 +2392,33 @@ with tab_close:
                     f"(reprocessing_required for this explicitly-reopened period is `True` "
                     "unconditionally per 5.F, regardless of this value)."
                 )
+                # Principal-directed fix (live-testing session): a file
+                # currently sitting in the uploader that this candidate
+                # was NOT built from -- either because it was attached
+                # after this candidate was built (including the very
+                # first, automatic no-op build that fires the moment a
+                # reopen is confirmed, before the user has attached
+                # anything) or because it has since been replaced with a
+                # different file. Without this, "Approve candidate close"
+                # below could silently approve a candidate that does not
+                # reflect the file the user can see sitting in the
+                # uploader -- which is exactly the live-testing finding
+                # this fixes (reported: uploading a correction, then
+                # clicking Approve directly, silently closed against the
+                # unchanged saved data and cancelled the reopen instead of
+                # applying the upload). The Approve handler below hard-
+                # blocks on this same condition; this banner is what
+                # explains why, before the click.
+                _candidate_is_stale = (
+                    _corrected_file is not None and _current_upload_id != _cand.get("source_file_id")
+                )
+                if _candidate_is_stale:
+                    st.warning(
+                        f"**{_corrected_file.name}** is attached but this candidate was not built from it "
+                        "(shown above) — approving now would NOT apply this file. Click **Run correction "
+                        "intake** above to rebuild the candidate from it, or remove the file to proceed with "
+                        "the candidate as already built."
+                    )
                 if _cand.get("excluded_out_of_period_rows"):
                     st.info(
                         f"{len(_cand['excluded_out_of_period_rows'])} out-of-period row(s) were excluded from "
@@ -2101,6 +2509,24 @@ with tab_close:
                 _gate_c1, _gate_c2 = st.columns(2)
                 with _gate_c1:
                     if st.button("Approve candidate close", key="approve_candidate_close_btn"):
+                        # Principal-directed fix (live-testing session):
+                        # hard, authoritative re-check of the same
+                        # staleness condition the banner above already
+                        # warns about -- same pattern as the close-order
+                        # and unresolved-reopen hard checks elsewhere in
+                        # this handler (an early warning is not enough by
+                        # itself; the click itself must also be stopped).
+                        # Re-reads _corrected_file/_current_upload_id
+                        # fresh rather than trusting a value computed
+                        # earlier in this same render, for the same reason
+                        # those other checks do.
+                        if _corrected_file is not None and _current_upload_id != _cand.get("source_file_id"):
+                            st.error(
+                                f"**{_corrected_file.name}** is attached but this candidate was not built from "
+                                "it. Click **Run correction intake** to rebuild the candidate from this file, "
+                                "or remove it before approving."
+                            )
+                            st.stop()
                         try:
                             # Item F (D15-Item2-Corrections Addendum 1) --
                             # zero-net-change guard. Blocks BEFORE any
@@ -2125,7 +2551,56 @@ with tab_close:
                                 _guard_prior_commentary, _cand.get("commentary_records", {})
                             )
                             if not _cand["numerical_impact"] and not _guard_commentary_changed:
-                                st.warning(f"No change detected in {R.fmt_period_label(_rp)} — nothing to correct.")
+                                # Live-testing finding (Principal-directed,
+                                # same session as the unresolved-reopen
+                                # block above): this used to show the
+                                # warning and call st.stop() -- but since
+                                # st.stop() is inside this button's click
+                                # handler, it halted the ENTIRE script for
+                                # this render, so nothing below it (the
+                                # "Reject candidate" button in the other
+                                # column, and "Start over" further down)
+                                # rendered either -- leaving no visible way
+                                # off this screen. Nothing was ever written
+                                # to Close History for this candidate
+                                # (5.C/5.D never persists before Approve
+                                # succeeds), so there is nothing to undo --
+                                # resolving it automatically, exactly as
+                                # "Start over" below does, is both the fix
+                                # for that and the more sensible behavior:
+                                # there is nothing left to correct, so
+                                # nothing is gained by leaving it open for
+                                # a second, manual "Start over" click.
+                                if _cand.get("persist_dir"):
+                                    shutil.rmtree(_cand["persist_dir"], ignore_errors=True)
+                                st.session_state["reopen_step"] = 0
+                                st.session_state["reopen_target_period"] = None
+                                st.session_state.pop("reopen_candidate", None)
+                                st.session_state.pop("reopen_candidate_approval_status", None)
+                                st.session_state["reopen_candidate_build_error"] = None
+                                st.session_state["reopen_uploader_generation"] = (
+                                    st.session_state.get("reopen_uploader_generation", 0) + 1
+                                )
+                                st.toast(
+                                    f"No change detected in {R.fmt_period_label(_rp)} — nothing to correct. "
+                                    "Reopen cancelled.",
+                                    icon="ℹ️",
+                                )
+                                st.rerun()
+
+                            # D15 Items 3 & 4 -- hard, authoritative
+                            # close-order / reopen-propagation check,
+                            # immediately before archive_close() runs (same
+                            # design as the live single-period Approve
+                            # handler). Checks _rp -- the period actually
+                            # being reopened and re-closed here -- against
+                            # ITS predecessors, never against itself.
+                            # Procedural only: nothing above or below this
+                            # sets, clears, or implies any Human Approval
+                            # Gate (D13) criterion.
+                            _close_order_blocker = PL.find_close_order_blocker(_rp, R.quarter_order, close_history)
+                            if _close_order_blocker is not None:
+                                st.error(_fmt_close_order_block_message(_close_order_blocker, _rp))
                                 st.stop()
 
                             # Correction 1: version computed dynamically,
@@ -2176,6 +2651,102 @@ with tab_close:
                                 ),
                             )
                             st.session_state["reopen_candidate_approval_status"] = "approved"
+
+                            # Principal-directed fix (live-testing session):
+                            # the reopen candidate keeps its OWN commentary_
+                            # records dict (_cand["commentary_records"]),
+                            # entirely separate from the top-level
+                            # st.session_state["commentary_records"] that the
+                            # workflow-state strip (Explanations Validated),
+                            # the closed-period read-only Commentary Review
+                            # view, and the Narrative tab all read from.
+                            # Nothing ever copied the candidate's dict back
+                            # into the top-level one -- it was archived
+                            # correctly to Close History (via
+                            # serialize_commentary_records just above) and
+                            # then discarded a few lines below when
+                            # "reopen_candidate" is popped from session
+                            # state, so a correction's accepted commentary
+                            # durably existed on disk but was invisible
+                            # everywhere else in this session: the narrative
+                            # reported it as "commentary process attempted
+                            # but no accepted explanation currently exists",
+                            # and "Explanations Validated" stayed unchecked,
+                            # even though the Controller had already written
+                            # and accepted it. Confirmed live (both by
+                            # reproducing it directly and independently by
+                            # you hitting the identical symptom).
+                            #
+                            # A plain dict.update() is sufficient and safe: a
+                            # stale key from a superseded observation (e.g. a
+                            # prior version's flag that the correction
+                            # resolved and which no longer appears in the
+                            # current observation register) is never looked
+                            # up by ID against anything but the CURRENT
+                            # register everywhere it's consumed
+                            # (_render_commentary_review_records skips a
+                            # non-matching oid; the workflow-state strip's
+                            # open-uncommented count is a set difference
+                            # against the current register's own IDs;
+                            # build_narrative_commentary_section iterates the
+                            # current register's flagged rows, never the
+                            # commentary dict's keys) -- so it becomes
+                            # harmlessly inert rather than wrong.
+                            st.session_state["commentary_records"].update(
+                                _cand.get("commentary_records", {})
+                            )
+
+                            # D15 Items 3 & 4 -- bootstrap rule (no-op
+                            # unless this is genuinely the very first close
+                            # ever under this rule -- should not normally
+                            # happen via a reopen, since a reopen implies
+                            # _rp was already closed once, but this is
+                            # cheap safety, not a new decision).
+                            close_history.establish_close_order_baseline_if_absent(_rp)
+                            # _rp has now itself been reopened and
+                            # re-closed -- clear any pending_reprocessing.json
+                            # flag it was carrying (Definitions, design note
+                            # §3: resolved iff no such file, or it is
+                            # marked resolved: true).
+                            close_history.resolve_pending_reprocessing(_rp)
+
+                            # 5.G propagation-writing step: walk forward
+                            # from _rp using the ALREADY-BUILT, unmodified
+                            # run_propagation_chain()/reprocessing_required_
+                            # for_downstream() (Category A). compare_fn
+                            # compares each downstream period's OWN
+                            # currently-archived rollups_output.xlsx
+                            # (before) against the workbook just archived
+                            # for _rp's new version (after) -- that
+                            # workbook is rollups.py's full, whole-dataset
+                            # recompute, so it already carries every other
+                            # period's own recalculated QoQ-vs-prior-period
+                            # figures reflecting this correction, without
+                            # those other periods needing to be re-closed
+                            # themselves first. Attribution stays _rp (the
+                            # actual explicit-reopen source) for every hop
+                            # examined in this one pass, per the Message
+                            # Wording section's "the reopen that caused it".
+                            _archived_rollups_path = os.path.join(_archived_folder, "rollups_output.xlsx")
+
+                            def _d15_propagation_compare_fn(downstream_period, predecessor_descriptor):
+                                _prior_close = close_history.resolve_latest_approved_close_for_period(downstream_period)
+                                if _prior_close is None:
+                                    # Nothing archived yet for this downstream
+                                    # period to compare against -- not affected.
+                                    return False, predecessor_descriptor
+                                _impact, _ = PL.compare_period_outputs(
+                                    downstream_period, _prior_close["rollups_output_path"], _archived_rollups_path
+                                )
+                                return _impact, predecessor_descriptor
+
+                            _propagation_steps = PL.run_propagation_chain(
+                                _rp, R.quarter_order, _d15_propagation_compare_fn
+                            )
+                            for _step in _propagation_steps[1:]:
+                                if _step.reprocessing_required:
+                                    close_history.write_pending_reprocessing(_step.period_label, _rp)
+
                             # Temp files are cleaned up only now that the
                             # candidate is RESOLVED (approved) -- never
                             # earlier.

@@ -32,6 +32,7 @@ pipeline (and the plausibility/diff phases) produced.
 """
 
 import os
+import glob
 import json
 import shutil
 import subprocess
@@ -258,6 +259,45 @@ def resolve_latest_approved_close_for_period(period_label, close_history_dir=DEF
     return None
 
 
+def resolve_canonical_dataset_path():
+    """Principal-directed extension (two-tier per-period data sourcing,
+    live-testing session): the one fixed, canonical raw dataset -- the
+    original seed workbook, never written to or perturbed by any close,
+    reopen, or correction activity. Single source of truth for two
+    call sites that both need the exact same file:
+      1. rollups.py's own bootstrap fallback (Close History empty --
+         nothing approved yet to resolve).
+      2. period_lifecycle.assemble_governed_dataset() and
+         enforce_period_scoped_correction()'s fallback for any period
+         that has never been closed -- such a period's value must never
+         come from a correction upload for some OTHER period (even one
+         that happens to include out-of-period rows mentioning it), only
+         from this canonical file, until it is itself closed for the
+         first time.
+    Previously this glob search lived only inside rollups.py's own
+    find_raw_dataset(), duplicated here would have meant two
+    independently-maintained definitions of "canonical" that could
+    silently drift apart -- this is the one definition both now use.
+    """
+    candidates = [
+        f for f in glob.glob("*.xlsx")
+        if "northwind" in f.lower() and "sample" in f.lower() and "dataset" in f.lower()
+        and "output" not in f.lower()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            "Could not resolve the canonical raw dataset: expected a file with 'Northwind', "
+            "'Sample', and 'Dataset' in the name, e.g. 'Northwind_Sample_Dataset.xlsx', in the "
+            "current directory."
+        )
+    if len(candidates) > 1:
+        raise FileNotFoundError(
+            f"Found multiple candidate canonical dataset files, ambiguous which to use: {candidates}. "
+            "Keep only one in this directory, or rename the others."
+        )
+    return candidates[0]
+
+
 def resolve_latest_approved_close(close_history_dir=DEFAULT_CLOSE_HISTORY_DIR, latest_version_only=True):
     """Return a dict describing the latest APPROVED close, or None if
     Close History is empty / has no valid snapshots (the bootstrap case).
@@ -395,3 +435,124 @@ def archive_close(
         json.dump(metadata, f, indent=2, default=str)
 
     return folder, metadata
+
+
+# -----------------------------------------------------------------------
+# D15 Items 3 & 4 — Chronological Close-Order Enforcement & Reopen-
+# Propagation Blocking (Principal-confirmed 2026-09-28). Two small sidecar
+# files, deliberately NOT new close-history versions or a schema change to
+# the existing snapshot format: both live ALONGSIDE, never inside, the
+# versioned snapshot folders, so resolve_latest_approved_close_for_period()/
+# resolve_latest_approved_close() and Executive Ready logic never see them
+# and cannot be affected by them.
+# -----------------------------------------------------------------------
+
+BASELINE_FILENAME = "_baseline.json"
+PENDING_REPROCESSING_FILENAME = "pending_reprocessing.json"
+
+
+def read_close_order_baseline(close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """Returns the write-once bootstrap-baseline record
+    {"baseline_period": <label>, "established_at": <iso ts>}, or None if
+    no period has ever closed under this rule yet (close-order enforcement
+    has not started)."""
+    path = os.path.join(close_history_dir, BASELINE_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def establish_close_order_baseline_if_absent(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """Write close_history/_baseline.json exactly once — the first time
+    any period closes under this rule — recording period_label as the
+    permanent baseline. A no-op returning the EXISTING record, unchanged,
+    if a baseline already exists: never overwritten, recomputed, or moved
+    afterward, per the confirmed bootstrap rule. This function only
+    writes the record; it is the caller's responsibility to call it only
+    on a close attempt's own success, never speculatively."""
+    existing = read_close_order_baseline(close_history_dir)
+    if existing is not None:
+        return existing
+    os.makedirs(close_history_dir, exist_ok=True)
+    record = {
+        "baseline_period": period_label,
+        "established_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(os.path.join(close_history_dir, BASELINE_FILENAME), "w") as f:
+        json.dump(record, f, indent=2)
+    return record
+
+
+def _pending_reprocessing_path(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    return os.path.join(close_history_dir, period_label, PENDING_REPROCESSING_FILENAME)
+
+
+def read_pending_reprocessing(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """Returns period_label's sidecar dict, or None if it has never been
+    flagged as reopen-affected. Does NOT itself apply the Definitions
+    "resolved" test (design note §3) — a returned dict may carry
+    resolved: true; callers deciding blocking status should treat
+    resolved: true the same as no record at all."""
+    path = _pending_reprocessing_path(period_label, close_history_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_pending_reprocessing(period_label, predecessor_period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """5.G propagation-writing step: mark period_label as affected by an
+    upstream reopen and not yet resolved, naming the reopened predecessor
+    that caused it. Overwrites any existing (e.g. already-resolved) record
+    for period_label — a period can be re-flagged by a later, independent
+    reopen after a prior flag was resolved."""
+    folder = os.path.join(close_history_dir, period_label)
+    os.makedirs(folder, exist_ok=True)
+    record = {
+        "period_label": period_label,
+        "predecessor_period_label": predecessor_period_label,
+        "flagged_at": datetime.now(timezone.utc).isoformat(),
+        "resolved": False,
+    }
+    with open(_pending_reprocessing_path(period_label, close_history_dir), "w") as f:
+        json.dump(record, f, indent=2)
+    return record
+
+
+def resolve_pending_reprocessing(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """Mark period_label's pending_reprocessing.json resolved: true —
+    called when that period is itself reopened and re-closed. A no-op
+    (returns None) if no such record exists for period_label."""
+    rec = read_pending_reprocessing(period_label, close_history_dir)
+    if rec is None:
+        return None
+    rec["resolved"] = True
+    rec["resolved_at"] = datetime.now(timezone.utc).isoformat()
+    with open(_pending_reprocessing_path(period_label, close_history_dir), "w") as f:
+        json.dump(rec, f, indent=2)
+    return rec
+
+
+def reprocessing_state_by_period(period_order, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """The dict shape period_lifecycle.find_blocking_predecessor() (5.H)
+    expects: {period_label -> {"reprocessing_required": bool, "resolved": bool}}.
+    Derived purely by checking each period in period_order for this
+    sidecar file's presence — not a new complex data model, per the
+    Brief's Implementation section."""
+    out = {}
+    for p in period_order:
+        rec = read_pending_reprocessing(p, close_history_dir)
+        if rec is None:
+            continue
+        out[p] = {
+            "reprocessing_required": True,
+            "resolved": bool(rec.get("resolved", False)),
+        }
+    return out

@@ -166,22 +166,24 @@ def build_observation_register(phase2_result, phase3_result, fmt_period_label, c
     this module has zero import-time coupling to close_validation.py
     (keeps this module trivially unit-testable, same rationale
     close_validation.py itself documents for its own interface choices).
+
+    Principal directive (2026-09-29): Phase 2 (Deterministic Validation /
+    "Historical Revision") findings must NOT generate an Observation ID and
+    must NOT enter this register. A Phase 2 row is a raw-data diff against
+    the prior approved close -- e.g. a correction landing in a reopened
+    period -- not a plausibility judgment a Controller can meaningfully
+    narrate ("the number changed because we corrected it" isn't an
+    explanation). Requiring commentary against it, and gating "Explanations
+    Validated"/"Awaiting Controller Input" on it, was a real UX defect: the
+    Controller had nothing to say and no way to satisfy the gate other than
+    writing a placeholder. Phase 2's own findings remain fully visible on
+    the dedicated "Phase 2 — Deterministic Validation" section of the Close
+    Validation Status tab (rendered directly from phase2_result.flagged_rows,
+    independent of this register) -- only the Commentary Review / gating
+    path is affected. phase2_result is still accepted as a parameter for
+    call-site/signature stability, but intentionally unused below.
     """
     rows = []
-    if phase2_result.status == cv_status_ok:
-        for _, r in phase2_result.flagged_rows.iterrows():
-            period_label = r["Date"].strftime("%b %Y") if pd.notna(r["Date"]) else ""
-            obs_id = make_observation_id("Phase 2", period_label, r["Department"], r["Category"])
-            rows.append({
-                "Observation ID": obs_id,
-                "Detected By": "Phase 2 (Deterministic Validation)",
-                "Period": period_label,
-                "Type": "Historical Revision",
-                "Department": r["Department"], "Category": r["Category"],
-                "Before ($)": r["Amount ($)_prior"], "After ($)": r["Amount ($)_current"],
-                "Delta ($)": r["Diff ($)"],
-                "Threshold Crossed": None,
-            })
     if phase3_result.status == cv_status_ok:
         for _, r in phase3_result.flagged_rows.iterrows():
             # Period representation (investigated per builder_task_final,

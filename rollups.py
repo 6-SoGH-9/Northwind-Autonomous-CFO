@@ -59,6 +59,49 @@ try:
 except ImportError:
     COMMENTARY_WORKFLOW = None
 
+# Two-tier per-period data sourcing (Principal-directed, live-testing
+# session): guarded exactly like commentary_workflow above, for the same
+# reason -- period_lifecycle.compute_candidate_rollups_output() stages
+# and runs this exact file as a standalone subprocess in an isolated
+# scratch directory that copies only rollups.py and close_history.py
+# (never period_lifecycle.py), with NORTHWIND_RAW_DATASET_PATH always
+# set for that run -- which find_raw_dataset() below checks FIRST and
+# returns from immediately, so that specific call path never reaches the
+# code that would need this import. This guard is defense in depth for
+# any OTHER subprocess-style invocation that might not set the env
+# override: find_raw_dataset() falls back to the pre-existing single-
+# latest-close behavior when PERIOD_LIFECYCLE is None, rather than
+# failing to import at all.
+try:
+    import period_lifecycle
+    PERIOD_LIFECYCLE = period_lifecycle
+except ImportError:
+    PERIOD_LIFECYCLE = None
+
+
+def add_fiscal_cols(df, date_col="Date"):
+    """Add Fiscal Quarter (e.g. 'Q1 FY2024') and Fiscal Year (e.g. 'FY2024') columns.
+    FY = Jul-Jun, labeled by the calendar year it ends in.
+
+    Moved ABOVE find_raw_dataset()/RAW below (unchanged in every other
+    respect) so find_raw_dataset() can call it via the self-reference
+    shim defined at that call site -- this module hasn't finished
+    importing yet at that point, so `import rollups as R` can't be used
+    there; the shim needs add_fiscal_cols to already exist as a module-
+    level name, which requires this function to be defined before that
+    call, not after it as previously."""
+    df = df.copy()
+    d = pd.to_datetime(df[date_col])
+    fy = pd.Series(
+        np.where(d.dt.month >= 7, d.dt.year + 1, d.dt.year), index=df.index
+    ).astype(int)
+    fq = pd.Series(
+        ((d.dt.month - 7) % 12) // 3 + 1, index=df.index
+    ).astype(int)
+    df["Fiscal Year"] = "FY" + fy.astype(str)
+    df["Fiscal Quarter"] = "Q" + fq.astype(str) + " FY" + fy.astype(str)
+    return df
+
 
 def find_raw_dataset():
     """Resolve which raw dataset file this run of the pipeline should build
@@ -71,11 +114,22 @@ def find_raw_dataset():
          incoming dataset for the close currently being processed (which,
          by definition, is not yet an *approved* close, so it can't be
          found in Close History). Takes precedence when set.
-      2. The latest APPROVED close in Close History (close_history/), found
-         dynamically via close_history.resolve_latest_approved_close() —
-         i.e., whichever snapshot has the max approval_timestamp in its own
-         metadata.json, not whichever file happens to glob-match a naming
-         pattern.
+      2. Two-tier per-period governed assembly (Principal-directed, live-
+         testing session, supersedes the original "just trust whichever
+         close has the latest approval_timestamp, wholesale" behavior):
+         if Close History has at least one approved close anywhere,
+         build ONE composite dataset via
+         period_lifecycle.assemble_governed_dataset() -- every period
+         that has ever been closed is sourced from ITS OWN latest
+         approved snapshot (never perturbed by any other period's
+         reopen/correction activity); every period that hasn't is
+         sourced from the fixed canonical dataset (never from any other
+         period's correction upload, even one that happens to reference
+         it). See that function's own docstring for the full rationale.
+         Falls back to the OLD single-latest-close behavior if
+         period_lifecycle could not be imported (see PERIOD_LIFECYCLE
+         above) -- defense in depth, not expected to trigger in the live
+         dashboard process.
       3. Bootstrap fallback: if Close History does not exist yet or is
          empty (a real, expected first-run state), fall back to the same
          filename-pattern search used before Cycle 3, so a fresh
@@ -94,6 +148,24 @@ def find_raw_dataset():
 
     resolved = close_history.resolve_latest_approved_close()
     if resolved is not None:
+        if PERIOD_LIFECYCLE is not None:
+            class _RollupsSelfRef:
+                """Minimal R_module-shaped shim: assemble_governed_dataset()
+                only needs add_fiscal_cols, already defined above this
+                point in this same file -- `import rollups as R` can't be
+                used here since this module hasn't finished importing
+                yet (this call happens while RAW = find_raw_dataset() is
+                still executing)."""
+                add_fiscal_cols = staticmethod(add_fiscal_cols)
+
+            governed_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "governed_raw_dataset.xlsx"
+            )
+            return PERIOD_LIFECYCLE.assemble_governed_dataset(
+                R_module=_RollupsSelfRef,
+                close_history_module=close_history,
+                out_path=governed_path,
+            )
         return resolved["raw_dataset_path"]
 
     # Bootstrap fallback — unchanged from pre-Cycle-3 glob logic, used only
@@ -152,22 +224,6 @@ except ValueError:
     pl_summary = pd.DataFrame(columns=[
         "Date", "Total Revenue ($)", "Total Opex ($)", "Gross Profit ($)", "Gross Margin (%)",
     ])
-
-
-def add_fiscal_cols(df, date_col="Date"):
-    """Add Fiscal Quarter (e.g. 'Q1 FY2024') and Fiscal Year (e.g. 'FY2024') columns.
-    FY = Jul-Jun, labeled by the calendar year it ends in."""
-    df = df.copy()
-    d = pd.to_datetime(df[date_col])
-    fy = pd.Series(
-        np.where(d.dt.month >= 7, d.dt.year + 1, d.dt.year), index=df.index
-    ).astype(int)
-    fq = pd.Series(
-        ((d.dt.month - 7) % 12) // 3 + 1, index=df.index
-    ).astype(int)
-    df["Fiscal Year"] = "FY" + fy.astype(str)
-    df["Fiscal Quarter"] = "Q" + fq.astype(str) + " FY" + fy.astype(str)
-    return df
 
 
 # -----------------------------------------------------------------------------
@@ -359,7 +415,7 @@ exp_by_dept_q = add_yoy_on_quarters(exp_by_dept_q, "Department")
 #    and ENDING (last month's snapshot) headcount. Headcount is a stock, not a
 #    flow, so "rollup" here means these two different snapshots, not a sum.
 # ---------------------------------------------------------------------------
-def build_headcount_rollup(period_col):
+def build_headcount_rollup(period_col, period_order=None):
     avg = (
         headcount.groupby(["Department", period_col], as_index=False)["Headcount"]
         .mean()
@@ -369,24 +425,65 @@ def build_headcount_rollup(period_col):
     snap = headcount[headcount["Date"] == last_month][["Department", period_col, "Headcount"]]
     snap = snap.rename(columns={"Headcount": "Ending Headcount"})
     out = avg.merge(snap, on=["Department", period_col])
-    return out.sort_values(["Department", period_col]).reset_index(drop=True)
+    out = out.sort_values(["Department", period_col]).reset_index(drop=True)
+    # D15 Items 3 & 4 (Category B, CANONICAL_COMPARISON_SET QoQ extension,
+    # Principal-confirmed 2026-09-28): sequential (QoQ) variance on both
+    # headcount cuts, added so a reopen's downstream QoQ effect on
+    # Headcount_Q is actually detectable. Reuses the SAME add_variance()
+    # helper already tie-out-verified for Revenue/Expense elsewhere in this
+    # file -- no new period logic invented. Headcount is a stock, not a
+    # flow, so "QoQ variance" here means change vs. the immediately
+    # preceding period's own snapshot, same semantics as every other QoQ
+    # column in this file. period_order is optional (default None, no
+    # variance columns) so any other caller of this function is unaffected.
+    if period_order is not None:
+        out = add_variance(out, ["Department"], "Avg Headcount", period_col, period_order, 1)
+        out = out.rename(columns={
+            "Prior": "Avg Headcount Prior Period",
+            "Variance $": "Avg Headcount QoQ/YoY Variance",
+            "Variance %": "Avg Headcount QoQ/YoY Variance (%)",
+        })
+        out = add_variance(out, ["Department"], "Ending Headcount", period_col, period_order, 1)
+        out = out.rename(columns={
+            "Prior": "Ending Headcount Prior Period",
+            "Variance $": "Ending Headcount QoQ/YoY Variance",
+            "Variance %": "Ending Headcount QoQ/YoY Variance (%)",
+        })
+    return out
 
 
-hc_by_dept_q = build_headcount_rollup("Fiscal Quarter")
-hc_by_dept_y = build_headcount_rollup("Fiscal Year")
+hc_by_dept_q = build_headcount_rollup("Fiscal Quarter", quarter_order)
+hc_by_dept_y = build_headcount_rollup("Fiscal Year", year_order)
 
 # ---------------------------------------------------------------------------
 # 6. Budget vs Actual rollups — sum Budget & Actual, recompute variance
 # ---------------------------------------------------------------------------
-def build_bva_rollup(period_col):
+def build_bva_rollup(period_col, period_order=None):
     g = bva.groupby(["Line Item", period_col], as_index=False)[["Budget ($)", "Actual ($)"]].sum()
     g["Variance ($)"] = g["Actual ($)"] - g["Budget ($)"]
     g["Variance (%)"] = np.where(g["Budget ($)"] != 0, g["Variance ($)"] / g["Budget ($)"], np.nan)
+    # D15 Items 3 & 4 (Category B, CANONICAL_COMPARISON_SET QoQ extension,
+    # Principal-confirmed 2026-09-28): sequential (QoQ) variance on Actual
+    # ($) only -- Budget ($) is a planning figure a data correction does
+    # not change, so it gets no QoQ column here. Reuses the SAME
+    # add_variance() helper already tie-out-verified elsewhere in this file
+    # (add_sequential_variance is defined later in the file, after this
+    # function is first called at module load, so it is not usable here --
+    # add_variance is the equivalent already in scope). period_order is
+    # optional (default None, no variance columns) so any other caller of
+    # this function is unaffected.
+    if period_order is not None:
+        g = add_variance(g, ["Line Item"], "Actual ($)", period_col, period_order, 1)
+        g = g.rename(columns={
+            "Prior": "Actual QoQ/YoY Prior Period ($)",
+            "Variance $": "Actual QoQ/YoY Variance ($)",
+            "Variance %": "Actual QoQ/YoY Variance (%)",
+        })
     return g
 
 
-bva_q = build_bva_rollup("Fiscal Quarter")
-bva_y = build_bva_rollup("Fiscal Year")
+bva_q = build_bva_rollup("Fiscal Quarter", quarter_order)
+bva_y = build_bva_rollup("Fiscal Year", year_order)
 
 # ---------------------------------------------------------------------------
 # 7. PL rollups (Revenue, Opex, Operating Profit, Operating Margin)
@@ -1544,6 +1641,127 @@ def call_claude_narrative(user_prompt, model="claude-sonnet-4-6", max_tokens=150
     except Exception as e:
         return None, f"API call failed: {e}"
 
+
+# ---------------------------------------------------------------------------
+# 14b. Freeze already-closed periods' DERIVED/rollup tables (Principal-
+# directed, live-testing session: two-tier sourcing above only froze RAW
+# transactional values; every cross-period metric -- QoQ/YoY variance, PL
+# rollups, margin/breadth/concentration, volume-rate bridges -- was still
+# recomputed fresh on every import, so an already-closed, never-reopened
+# period's own QoQ could silently drift whenever its NEIGHBOR was later
+# corrected. See period_lifecycle.freeze_closed_period_tables() docstring
+# for the full root cause and the fix.
+#
+# Gated behind `PERIOD_LIFECYCLE is not None` -- the same guarded-import
+# pattern used for the raw-level freeze above. This is not just a style
+# match: it is the actual mechanism that keeps the reopen-candidate
+# "what-if" preview live/unfrozen. compute_candidate_rollups_output()
+# runs this file as an isolated subprocess that copies in ONLY rollups.py
+# and close_history.py (never period_lifecycle.py), so PERIOD_LIFECYCLE
+# is always None there -- this whole block is automatically skipped, and
+# the candidate preview correctly shows live-recomputed downstream
+# effects. On the live dashboard's `import rollups as R`, period_lifecycle
+# IS available, so every closed period's derived rows get frozen here.
+# ---------------------------------------------------------------------------
+if PERIOD_LIFECYCLE is not None:
+    _ALL_ROLLUP_TABLES = {
+        "PL_Quarterly": pl_q,
+        "PL_Annual": pl_y,
+        "Rev_by_Region_Q": rev_by_region_q,
+        "Rev_by_Region_Y": rev_by_region_y,
+        "Rev_by_Product_Q": rev_by_product_q,
+        "Rev_by_Product_Y": rev_by_product_y,
+        "Exp_by_Dept_Q": exp_by_dept_q,
+        "Exp_by_Dept_Y": exp_by_dept_y,
+        "Exp_by_Dept_Cat_Q": exp_by_dept_cat_q,
+        "Exp_by_Dept_Cat_Y": exp_by_dept_cat_y,
+        "Exp_by_Cat_Q": exp_by_cat_q,
+        "Exp_by_Cat_Y": exp_by_cat_y,
+        "Headcount_Q": hc_by_dept_q,
+        "Headcount_Y": hc_by_dept_y,
+        "BvA_Q": bva_q,
+        "BvA_Y": bva_y,
+        "RegionNetGTMCost_Q": region_cm_q,
+        "RegionNetGTMCost_Y": region_cm_y,
+        "ProductNetRDCost_Q": product_cm_q,
+        "ProductNetRDCost_Y": product_cm_y,
+        "RegionGTMPctTrend_Q": region_gtm_pct_q,
+        "RegionGTMPctTrend_Y": region_gtm_pct_y,
+        "ProductRDPctTrend_Q": product_rd_pct_q,
+        "ProductRDPctTrend_Y": product_rd_pct_y,
+        "GA_Unallocated_Q": ga_overhead_q,
+        "GA_Unallocated_Y": ga_overhead_y,
+        "SB_VolRate_Q": sb_volrate_q,
+        "SB_VolRate_Y": sb_volrate_y,
+        "Breadth_Concentration_Q": breadth_all_q,
+        "Breadth_Concentration_Y": breadth_all_y,
+        "Headcount_Dept_Q": hc_dept_q,
+        "Headcount_Dept_Y": hc_dept_y,
+        "CompanyRevPerHC_Q": company_rev_per_hc_q,
+        "CompanyRevPerHC_Y": company_rev_per_hc_y,
+        "OpexPerEmployee_Q": opex_per_employee_q,
+        "OpexPerEmployee_Y": opex_per_employee_y,
+    }
+    try:
+        _FROZEN_ROLLUP_TABLES = PERIOD_LIFECYCLE.freeze_closed_period_tables(
+            _ALL_ROLLUP_TABLES, close_history
+        )
+    except Exception as _freeze_exc:
+        # Fail safe: a freeze-step error must never take down the live
+        # dashboard import. Fall back to the live-recomputed tables (the
+        # pre-existing, already-shipped behavior) and surface the error
+        # in the console rather than swallowing it silently.
+        print(f"WARNING: freeze_closed_period_tables failed ({_freeze_exc}); "
+              "using live-recomputed rollup tables for this import.")
+        _FROZEN_ROLLUP_TABLES = _ALL_ROLLUP_TABLES
+
+    pl_q = _FROZEN_ROLLUP_TABLES["PL_Quarterly"]
+    pl_y = _FROZEN_ROLLUP_TABLES["PL_Annual"]
+    rev_by_region_q = _FROZEN_ROLLUP_TABLES["Rev_by_Region_Q"]
+    rev_by_region_y = _FROZEN_ROLLUP_TABLES["Rev_by_Region_Y"]
+    rev_by_product_q = _FROZEN_ROLLUP_TABLES["Rev_by_Product_Q"]
+    rev_by_product_y = _FROZEN_ROLLUP_TABLES["Rev_by_Product_Y"]
+    exp_by_dept_q = _FROZEN_ROLLUP_TABLES["Exp_by_Dept_Q"]
+    exp_by_dept_y = _FROZEN_ROLLUP_TABLES["Exp_by_Dept_Y"]
+    exp_by_dept_cat_q = _FROZEN_ROLLUP_TABLES["Exp_by_Dept_Cat_Q"]
+    exp_by_dept_cat_y = _FROZEN_ROLLUP_TABLES["Exp_by_Dept_Cat_Y"]
+    exp_by_cat_q = _FROZEN_ROLLUP_TABLES["Exp_by_Cat_Q"]
+    exp_by_cat_y = _FROZEN_ROLLUP_TABLES["Exp_by_Cat_Y"]
+    hc_by_dept_q = _FROZEN_ROLLUP_TABLES["Headcount_Q"]
+    hc_by_dept_y = _FROZEN_ROLLUP_TABLES["Headcount_Y"]
+    bva_q = _FROZEN_ROLLUP_TABLES["BvA_Q"]
+    bva_y = _FROZEN_ROLLUP_TABLES["BvA_Y"]
+    region_cm_q = _FROZEN_ROLLUP_TABLES["RegionNetGTMCost_Q"]
+    region_cm_y = _FROZEN_ROLLUP_TABLES["RegionNetGTMCost_Y"]
+    product_cm_q = _FROZEN_ROLLUP_TABLES["ProductNetRDCost_Q"]
+    product_cm_y = _FROZEN_ROLLUP_TABLES["ProductNetRDCost_Y"]
+    region_gtm_pct_q = _FROZEN_ROLLUP_TABLES["RegionGTMPctTrend_Q"]
+    region_gtm_pct_y = _FROZEN_ROLLUP_TABLES["RegionGTMPctTrend_Y"]
+    product_rd_pct_q = _FROZEN_ROLLUP_TABLES["ProductRDPctTrend_Q"]
+    product_rd_pct_y = _FROZEN_ROLLUP_TABLES["ProductRDPctTrend_Y"]
+    ga_overhead_q = _FROZEN_ROLLUP_TABLES["GA_Unallocated_Q"]
+    ga_overhead_y = _FROZEN_ROLLUP_TABLES["GA_Unallocated_Y"]
+    sb_volrate_q = _FROZEN_ROLLUP_TABLES["SB_VolRate_Q"]
+    sb_volrate_y = _FROZEN_ROLLUP_TABLES["SB_VolRate_Y"]
+    breadth_all_q = _FROZEN_ROLLUP_TABLES["Breadth_Concentration_Q"]
+    breadth_all_y = _FROZEN_ROLLUP_TABLES["Breadth_Concentration_Y"]
+    hc_dept_q = _FROZEN_ROLLUP_TABLES["Headcount_Dept_Q"]
+    hc_dept_y = _FROZEN_ROLLUP_TABLES["Headcount_Dept_Y"]
+    company_rev_per_hc_q = _FROZEN_ROLLUP_TABLES["CompanyRevPerHC_Q"]
+    company_rev_per_hc_y = _FROZEN_ROLLUP_TABLES["CompanyRevPerHC_Y"]
+    opex_per_employee_q = _FROZEN_ROLLUP_TABLES["OpexPerEmployee_Q"]
+    opex_per_employee_y = _FROZEN_ROLLUP_TABLES["OpexPerEmployee_Y"]
+
+    # Persist the frozen versions too, so a caller re-reading
+    # rollups_output.xlsx from disk after `import rollups` (rather than
+    # using the in-memory dataframes) sees the same frozen values — not
+    # just the unconditional block's already-written live numbers.
+    try:
+        with pd.ExcelWriter("rollups_output.xlsx", engine="openpyxl", mode="a", if_sheet_exists="replace") as _fw:
+            for _sheet_name, _df in _FROZEN_ROLLUP_TABLES.items():
+                _df.to_excel(_fw, sheet_name=_sheet_name, index=False)
+    except Exception as _write_exc:
+        print(f"WARNING: could not re-persist frozen rollup tables to rollups_output.xlsx ({_write_exc}).")
 
 # ---------------------------------------------------------------------------
 # 15. RUN — generate narrative for Q4 FY2026 vs Q3 FY2026 (most recent

@@ -52,30 +52,49 @@ import pandas as pd
 # All other named canonical outputs are regenerated, never independently
 # compared (Brief Section 5.E, "All other named canonical outputs...").
 # -----------------------------------------------------------------------
+# D15 Items 3 & 4 (Category B, Principal-confirmed 2026-09-28): each
+# output's `fields` list now also includes its sequential (QoQ) variance
+# column(s) -- computed in rollups.py, reusing that file's existing
+# add_variance()/add_sequential_variance() helpers -- so that a reopen
+# which changes an UPSTREAM period's figures, and therefore a DOWNSTREAM
+# period's own QoQ comparison to that upstream period, is actually
+# detectable here even when the downstream period's own level fields are
+# unchanged. Without this extension the reopen-caused blocking case (Item
+# B, find_close_order_blocker()) could never fire on a pure QoQ effect.
+# The level fields already present (Revenue ($), Amount ($), etc.) are
+# UNCHANGED -- this is additive only, per the Brief's "Files that must not
+# change" / minimal-scope discipline.
 CANONICAL_COMPARISON_SET = {
     "PL_Quarterly": {
         "grain": ["Fiscal Quarter"],
-        "fields": ["Total Revenue ($)", "Total Opex ($)"],
+        "fields": [
+            "Total Revenue ($)", "Total Opex ($)",
+            "Total Revenue QoQ/YoY Var ($)", "Total Opex QoQ/YoY Var ($)",
+            "Operating Profit QoQ/YoY Var ($)",
+        ],
     },
     "Rev_by_Region_Q": {
         "grain": ["Region", "Fiscal Quarter"],
-        "fields": ["Revenue ($)"],
+        "fields": ["Revenue ($)", "QoQ/YoY Variance ($)"],
     },
     "Rev_by_Product_Q": {
         "grain": ["Product Line", "Fiscal Quarter"],
-        "fields": ["Revenue ($)"],
+        "fields": ["Revenue ($)", "QoQ/YoY Variance ($)"],
     },
     "Exp_by_Dept_Cat_Q": {
         "grain": ["Department", "Category", "Fiscal Quarter"],
-        "fields": ["Amount ($)"],
+        "fields": ["Amount ($)", "QoQ/YoY Variance ($)"],
     },
     "Headcount_Q": {
         "grain": ["Department", "Fiscal Quarter"],
-        "fields": ["Avg Headcount", "Ending Headcount"],
+        "fields": [
+            "Avg Headcount", "Ending Headcount",
+            "Avg Headcount QoQ/YoY Variance", "Ending Headcount QoQ/YoY Variance",
+        ],
     },
     "BvA_Q": {
         "grain": ["Line Item", "Fiscal Quarter"],
-        "fields": ["Budget ($)", "Actual ($)"],
+        "fields": ["Budget ($)", "Actual ($)", "Actual QoQ/YoY Variance ($)"],
     },
 }
 
@@ -292,6 +311,7 @@ def enforce_period_scoped_correction(raw_dataset_path, target_period, R_module, 
     violations = []
     reconstructed = {}
     _approved_cache = {}
+    _canonical_cache = {}
 
     def _approved_sheet_with_fq(other_period, sheet_name):
         if other_period not in _approved_cache:
@@ -305,6 +325,22 @@ def enforce_period_scoped_correction(raw_dataset_path, target_period, R_module, 
         adf = pd.read_excel(approved_xl, sheet_name)
         adf["Date"] = pd.to_datetime(adf["Date"])
         return R_module.add_fiscal_cols(adf)
+
+    def _canonical_sheet_with_fq(sheet_name):
+        # Principal-directed fix (two-tier per-period data sourcing,
+        # live-testing session): backs the fallback below for a period
+        # that has never been closed. Cached per sheet_name -- the
+        # canonical file never changes within one call.
+        if sheet_name not in _canonical_cache:
+            canonical_path = close_history_module.resolve_canonical_dataset_path()
+            canon_xl = pd.ExcelFile(canonical_path)
+            if sheet_name not in canon_xl.sheet_names:
+                _canonical_cache[sheet_name] = None
+            else:
+                cdf = pd.read_excel(canon_xl, sheet_name)
+                cdf["Date"] = pd.to_datetime(cdf["Date"])
+                _canonical_cache[sheet_name] = R_module.add_fiscal_cols(cdf)
+        return _canonical_cache[sheet_name]
 
     for sheet_name, spec in CORRECTION_SCOPE_SHEETS.items():
         if sheet_name not in all_sheets:
@@ -323,7 +359,33 @@ def enforce_period_scoped_correction(raw_dataset_path, target_period, R_module, 
             for other_period, group in out_of_period_rows.groupby("Fiscal Quarter"):
                 approved_fq = _approved_sheet_with_fq(other_period, sheet_name)
                 if approved_fq is None:
-                    kept_frames.append(group)
+                    # Principal-directed fix (two-tier per-period data
+                    # sourcing, live-testing session): a never-closed
+                    # OTHER period must NEVER take its value from this
+                    # upload -- not even silently, not even when nothing
+                    # approved exists yet to check it against. It comes
+                    # from the fixed canonical dataset instead, exactly
+                    # like an already-closed period comes from its own
+                    # approved snapshot -- so a correction upload for
+                    # target_period can never perturb a period that
+                    # hasn't been closed, whether or not that upload
+                    # happens to include rows for it.
+                    #
+                    # Previously: "nothing established to violate; those
+                    # rows are accepted as supplied, unchanged" -- which
+                    # silently let exactly that perturbation through (the
+                    # live-testing finding this fixes: a deliberately
+                    # modified Q4 row inside a Q2 reopen's upload leaked
+                    # into Q4's live figures everywhere, because Q4 had
+                    # never been closed).
+                    canonical_fq = _canonical_sheet_with_fq(sheet_name)
+                    if canonical_fq is not None:
+                        kept_frames.append(canonical_fq[canonical_fq["Fiscal Quarter"] == other_period])
+                    # If the canonical dataset has no rows for this period
+                    # either (should not happen -- canonical covers every
+                    # period that could ever exist), there is nothing
+                    # correct to substitute, so the upload's out-of-period
+                    # rows for it are dropped entirely rather than trusted.
                     continue
                 approved_period_rows = approved_fq[approved_fq["Fiscal Quarter"] == other_period]
 
@@ -368,6 +430,212 @@ def enforce_period_scoped_correction(raw_dataset_path, target_period, R_module, 
                 df_out = df_out.drop(columns=["Fiscal Year", "Fiscal Quarter"], errors="ignore")
             df_out.to_excel(writer, sheet_name=sheet_name, index=False)
     return out_path, out_dir, violations
+
+
+def assemble_governed_dataset(R_module, close_history_module, out_path):
+    """Two-tier per-period data sourcing (Principal-directed, live-
+    testing session) -- the SAME rule enforce_period_scoped_correction()
+    above already applies when reconciling ONE reopened period's own
+    candidate archive, generalized here to build the single composite
+    dataset that drives EVERY live dashboard page (rollups.py's own RAW),
+    not just the reopen-candidate flow:
+
+      - A period that has ever been closed (has its own approved Close
+        History snapshot) is ALWAYS sourced from that period's own
+        LATEST approved snapshot -- never from any other period's
+        reopen/correction activity, however that activity's raw dataset
+        happens to represent it. This is what keeps a closed period's
+        own figures, and its role as another period's prior-period QoQ
+        comparison basis, frozen and internally consistent with what was
+        actually approved for it -- exactly why the close-order/reopen-
+        propagation block exists: a closed period's QoQ can go stale
+        relative to a just-corrected predecessor, and must stay visibly
+        stale (not silently drift) until it is itself reopened and
+        reclosed.
+      - A period that has never been closed is ALWAYS sourced from the
+        one fixed canonical dataset (close_history_module.
+        resolve_canonical_dataset_path()) -- never from any correction
+        upload for a different period, even one that happens to include
+        rows mentioning it.
+
+    Called from rollups.py's own find_raw_dataset() (via the RAW module-
+    level resolution, re-run on every importlib.reload(R) after a close/
+    approve action) whenever Close History is non-empty, replacing the
+    prior "just trust close_history.resolve_latest_approved_close()'s
+    raw_dataset_path wholesale" behavior, which coupled every period's
+    displayed figures to whichever period happened to be reopened and
+    approved MOST RECENTLY -- not necessarily related to what's actually
+    being displayed.
+
+    R_module: object exposing add_fiscal_cols(df) -- either the real
+    `rollups` module (any external caller) or a minimal same-file shim
+    (rollups.py's own call, made before its own import has finished; see
+    that file's own comment at the call site for why).
+    close_history_module: the real `close_history` module.
+    out_path: where to write the assembled workbook.
+
+    Returns out_path. PL_Summary/README (and any sheet outside
+    CORRECTION_SCOPE_SHEETS) are passed through from the canonical
+    dataset unfiltered, same rationale as enforce_period_scoped_
+    correction() above.
+    """
+    canonical_path = close_history_module.resolve_canonical_dataset_path()
+    canon_xl = pd.ExcelFile(canonical_path)
+    canon_sheet_names = canon_xl.sheet_names
+    canon_sheets = {name: pd.read_excel(canon_xl, name) for name in canon_sheet_names}
+
+    assembled = {}
+    _approved_cache = {}
+
+    def _approved_sheet_with_fq(period, sheet_name):
+        key = (period, sheet_name)
+        if key not in _approved_cache:
+            approved = close_history_module.resolve_latest_approved_close_for_period(period)
+            if approved is None:
+                _approved_cache[key] = None
+            else:
+                approved_xl = pd.ExcelFile(approved["raw_dataset_path"])
+                if sheet_name not in approved_xl.sheet_names:
+                    _approved_cache[key] = None
+                else:
+                    adf = pd.read_excel(approved_xl, sheet_name)
+                    adf["Date"] = pd.to_datetime(adf["Date"])
+                    _approved_cache[key] = R_module.add_fiscal_cols(adf)
+        return _approved_cache[key]
+
+    for sheet_name, spec in CORRECTION_SCOPE_SHEETS.items():
+        if sheet_name not in canon_sheets:
+            continue
+        cdf = canon_sheets[sheet_name].copy()
+        cdf["Date"] = pd.to_datetime(cdf["Date"])
+        cdf_fq = R_module.add_fiscal_cols(cdf)
+
+        kept_frames = []
+        for period, group in cdf_fq.groupby("Fiscal Quarter"):
+            approved_fq = _approved_sheet_with_fq(period, sheet_name)
+            if approved_fq is None:
+                # Never closed -- canonical's own rows for this period
+                # stand, unchanged.
+                kept_frames.append(group)
+            else:
+                approved_period_rows = approved_fq[approved_fq["Fiscal Quarter"] == period]
+                kept_frames.append(approved_period_rows[group.columns])
+
+        result = pd.concat(kept_frames, ignore_index=True) if kept_frames else cdf_fq.iloc[0:0]
+        assembled[sheet_name] = result.drop(columns=["Fiscal Year", "Fiscal Quarter"], errors="ignore")
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        for sheet_name in canon_sheet_names:
+            df_out = assembled.get(sheet_name, canon_sheets[sheet_name])
+            df_out.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    return out_path
+
+
+def freeze_closed_period_tables(tables, close_history_module):
+    """Two-tier per-period data sourcing, extended to DERIVED/rollup
+    tables (Principal-directed, live-testing session: confirmed live --
+    reopening/correcting a period silently changed an unrelated, never-
+    reopened LATER period's own displayed QoQ, because it is adjacent to
+    the corrected one).
+
+    assemble_governed_dataset() (above) already freezes every closed
+    period's own RAW transactional values -- that alone is not enough.
+    rollups.py recomputes every cross-period metric (QoQ/YoY variance, PL
+    rollups, breadth/concentration, salaries volume/rate bridges, etc.)
+    fresh, every time, from whichever two adjacent periods currently sit
+    in the assembled raw data. So even with raw values correctly frozen,
+    an already-closed period's QoQ still silently drifted whenever its
+    NEIGHBOR was later corrected -- even though the period itself was
+    never reopened. Concretely: Q3 was closed against Q2's ORIGINAL
+    numbers; Q2 was later reopened and corrected; Q3's own level (Total
+    Revenue) stayed correctly frozen, but Q3's QoQ variance, recomputed
+    against Q2's NEW number, became a meaningless mix of "Q3 as actually
+    approved" vs "Q2 as it is now" -- a comparison that was never itself
+    reviewed or approved by anyone.
+
+    The fix: for a period that has already been closed, EVERY column of
+    its own row(s) in EVERY period-indexed table -- not just the raw
+    input sheets -- comes from that period's own latest approved
+    rollups_output.xlsx snapshot, verbatim, exactly as it was computed
+    and approved at close time. A period that has never been closed (or
+    is being closed for the FIRST time, so resolve_latest_approved_close_
+    for_period returns None) keeps its live-recomputed row, since there
+    is nothing yet to freeze it to -- consistent with
+    assemble_governed_dataset()'s same rule at the raw level.
+
+    Parameters
+    ----------
+    tables : dict of {sheet_name: DataFrame}
+        Every period-indexed output table rollups.py produces, keyed by
+        the exact sheet name it is written under in rollups_output.xlsx
+        (e.g. "PL_Quarterly", "Rev_by_Region_Q", "BvA_Q", ...). A table
+        with neither a "Fiscal Quarter" nor a "Fiscal Year" column is
+        passed through unchanged (nothing period-indexed to freeze).
+    close_history_module : the real `close_history` module.
+
+    Returns
+    -------
+    dict of {sheet_name: DataFrame}, same keys as `tables`, each value
+    either the original (no period column, or nothing yet to freeze) or
+    rebuilt with each already-closed period's rows replaced by that
+    period's own frozen archive. Row order within each sheet follows the
+    order periods first appear in the LIVE table (not re-sorted), so a
+    caller relying on existing ordering (e.g. quarter_order-derived) sees
+    no change in row order, only in which values populate an already-
+    closed period's row.
+    """
+    _archive_xl_cache = {}   # period_label -> pd.ExcelFile or None (never closed)
+
+    def _archived_workbook(period_label):
+        if period_label not in _archive_xl_cache:
+            approved = close_history_module.resolve_latest_approved_close_for_period(period_label)
+            if approved is None:
+                _archive_xl_cache[period_label] = None
+            else:
+                try:
+                    _archive_xl_cache[period_label] = pd.ExcelFile(approved["rollups_output_path"])
+                except Exception:
+                    # Fail safe: an unreadable archive must never crash the
+                    # live dashboard -- treat as "nothing to freeze to,"
+                    # same as a period that was never closed.
+                    _archive_xl_cache[period_label] = None
+        return _archive_xl_cache[period_label]
+
+    frozen = {}
+    for sheet_name, df in tables.items():
+        if "Fiscal Quarter" in df.columns:
+            period_col = "Fiscal Quarter"
+        elif "Fiscal Year" in df.columns:
+            period_col = "Fiscal Year"
+        else:
+            frozen[sheet_name] = df
+            continue
+
+        kept_frames = []
+        for period in df[period_col].unique():
+            group = df[df[period_col] == period]
+            archived_xl = _archived_workbook(period)
+            if archived_xl is None or sheet_name not in archived_xl.sheet_names:
+                # Never closed, OR being closed for the first time right
+                # now, OR (defensively) this sheet didn't exist yet in an
+                # older archive -- keep the live-recomputed row(s).
+                kept_frames.append(group)
+                continue
+            archived_df = pd.read_excel(archived_xl, sheet_name)
+            archived_rows = archived_df[archived_df[period_col] == period]
+            if len(archived_rows) == 0:
+                # Should not happen -- a closed period's own archived copy
+                # of its own sheet should always have its own rows. Fail
+                # safe by keeping the live rows rather than dropping data.
+                kept_frames.append(group)
+            else:
+                kept_frames.append(archived_rows.reindex(columns=group.columns))
+        frozen[sheet_name] = (
+            pd.concat(kept_frames, ignore_index=True) if kept_frames else df.iloc[0:0]
+        )
+
+    return frozen
 
 
 # -----------------------------------------------------------------------
@@ -872,3 +1140,97 @@ def build_lineage_metadata(trigger, predecessor=None, comparison_result=None, pr
     if excluded_out_of_period_rows:
         payload["excluded_out_of_period_rows"] = excluded_out_of_period_rows
     return payload
+
+
+# -----------------------------------------------------------------------
+# D15 Items 3 & 4 — Chronological Close-Order Enforcement & Reopen-
+# Propagation Blocking (Principal-confirmed 2026-09-28).
+#
+# find_close_order_blocker() is the single new function the Brief
+# specifies, combining both halves: (a) a predecessor at or after the
+# bootstrap baseline that has never been closed at all, and (b) a
+# predecessor that IS closed but carries an unresolved
+# pending_reprocessing.json (the reopen-caused case, built on top of the
+# already-existing, unmodified 5.G/5.H functions above via
+# close_history.reprocessing_state_by_period() + find_blocking_predecessor()
+# is deliberately NOT reused here -- see the docstring below for why a
+# direct predecessor-range scan is used instead).
+#
+# Like enforce_period_scoped_correction() above, this function takes
+# close_history_module as an injected dependency rather than importing
+# close_history directly, for the same reason: keeps this module's own
+# import graph one-directional and this function trivially unit-testable
+# against a stub/fake module (Testing section: "constructed period_order /
+# Close History fixtures").
+# -----------------------------------------------------------------------
+
+def find_close_order_blocker(target_period, period_order, close_history_module, close_history_dir=None):
+    """Returns None if target_period is not blocked, or a dict describing
+    the single OLDEST blocking predecessor:
+
+        {"blocking_period": <raw period label>,
+         "reason": "never_closed" | "reopen_impact",
+         "predecessor": <raw period label, or None for "never_closed">}
+
+    Considers predecessors of target_period only -- target_period itself
+    is never examined, so a period's own approval can succeed even while
+    it was itself the blocker on an earlier attempt.
+
+    Display formatting (fmt_period_label) and the exact message wording
+    (the Brief's Message Wording section) are the caller's responsibility
+    -- this module stays UI-agnostic (module docstring), same as every
+    other function here; only Northwind_Financial_Dashboard.py calls
+    fmt_period_label.
+
+    Bootstrap rule (Principal-confirmed 2026-09-28): if no baseline has
+    been established yet (close_history/_baseline.json absent), this is
+    the first close ever under this rule -- never blocked, regardless of
+    target_period's position in period_order. This function only READS
+    the baseline; establishing it on a close's own success is the
+    caller's responsibility (close_history.establish_close_order_baseline_if_absent).
+
+    Why a direct scan rather than find_blocking_predecessor(): that
+    function's contract is "the nearest blocking predecessor with
+    unresolved reprocessing_required" and says nothing about a
+    never-closed predecessor -- a period simply absent from
+    reprocessing_state_by_period reads as "not blocking" to it, exactly
+    right for 5.H's own reopen-only contract, but wrong here, where an
+    unclosed period must ALSO block even though it was never reopened.
+    Reusing it would require synthesizing a fake reprocessing_required
+    entry for every never-closed period first -- more indirection than
+    the direct scan below, which reads close_history_module's two
+    existing lookups (resolve_latest_approved_close_for_period,
+    read_pending_reprocessing) directly and needs no such synthesis.
+    """
+    dir_kwargs = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
+
+    baseline = close_history_module.read_close_order_baseline(**dir_kwargs)
+    if baseline is None:
+        return None
+
+    baseline_period = baseline.get("baseline_period")
+    if baseline_period not in period_order or target_period not in period_order:
+        # Either period can't be placed on the chronological axis --
+        # nothing to enforce. Should not occur in practice: period_order
+        # is the single source of truth for both target_period (the D15
+        # 5.B control) and the baseline (only ever established from a
+        # period drawn from this same list).
+        return None
+
+    baseline_idx = period_order.index(baseline_period)
+    target_idx = period_order.index(target_period)
+
+    for candidate in period_order[baseline_idx:target_idx]:
+        closed_info = close_history_module.resolve_latest_approved_close_for_period(candidate, **dir_kwargs)
+        if closed_info is None:
+            return {"blocking_period": candidate, "reason": "never_closed", "predecessor": None}
+
+        pending = close_history_module.read_pending_reprocessing(candidate, **dir_kwargs)
+        if pending is not None and not pending.get("resolved", False):
+            return {
+                "blocking_period": candidate,
+                "reason": "reopen_impact",
+                "predecessor": pending.get("predecessor_period_label"),
+            }
+
+    return None
