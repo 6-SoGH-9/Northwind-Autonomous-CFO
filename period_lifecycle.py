@@ -1169,8 +1169,11 @@ def find_close_order_blocker(target_period, period_order, close_history_module, 
     the single OLDEST blocking predecessor:
 
         {"blocking_period": <raw period label>,
-         "reason": "never_closed" | "reopen_impact",
+         "reason": "never_closed" | "reopen_impact" | "control_file_damaged",
          "predecessor": <raw period label, or None for "never_closed">}
+    ("control_file_damaged" also carries "detail" and a None
+    blocking_period: a close-order control file exists but is unreadable,
+    so the rule state is unknown and closing is blocked.)
 
     Considers predecessors of target_period only -- target_period itself
     is never examined, so a period's own approval can succeed even while
@@ -1204,7 +1207,17 @@ def find_close_order_blocker(target_period, period_order, close_history_module, 
     """
     dir_kwargs = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
 
-    baseline = close_history_module.read_close_order_baseline(**dir_kwargs)
+    # A damaged control file must BLOCK (fail safe), never read as "absent"
+    # (fail open). getattr keeps stub modules without the exception usable.
+    damaged = getattr(close_history_module, "ControlFileError", ())
+
+    def _damaged_blocker(exc):
+        return {"blocking_period": None, "reason": "control_file_damaged", "predecessor": None, "detail": str(exc)}
+
+    try:
+        baseline = close_history_module.read_close_order_baseline(**dir_kwargs)
+    except damaged as exc:
+        return _damaged_blocker(exc)
     if baseline is None:
         return None
 
@@ -1225,7 +1238,10 @@ def find_close_order_blocker(target_period, period_order, close_history_module, 
         if closed_info is None:
             return {"blocking_period": candidate, "reason": "never_closed", "predecessor": None}
 
-        pending = close_history_module.read_pending_reprocessing(candidate, **dir_kwargs)
+        try:
+            pending = close_history_module.read_pending_reprocessing(candidate, **dir_kwargs)
+        except damaged as exc:
+            return _damaged_blocker(exc)
         if pending is not None and not pending.get("resolved", False):
             return {
                 "blocking_period": candidate,
@@ -1234,3 +1250,62 @@ def find_close_order_blocker(target_period, period_order, close_history_module, 
             }
 
     return None
+
+
+# -----------------------------------------------------------------------
+# D15 Items 3 & 4 -- safe post-archive propagation bookkeeping (E and F).
+# -----------------------------------------------------------------------
+
+def make_safe_compare_fn(compare_fn, notices):
+    """Wrap a run_propagation_chain() compare_fn so that a downstream
+    period that cannot be compared (e.g. its archived workbook predates
+    newly required columns, or is missing/unreadable) is treated as
+    AFFECTED -- the safe side: it gets flagged and blocks later closes
+    until it is reopened and re-closed -- instead of the exception
+    aborting the approval half-way. A human-readable line is appended to
+    `notices` for each such period."""
+    def _safe(period_label, predecessor_descriptor):
+        try:
+            return compare_fn(period_label, predecessor_descriptor)
+        except Exception as exc:
+            notices.append(
+                f"{period_label} could not be compared with the corrected figures "
+                f"({type(exc).__name__}: {exc}); it has been treated as affected."
+            )
+            return True, predecessor_descriptor
+    return _safe
+
+
+def apply_propagation_flags(steps, reopened_period, close_history_module, close_history_dir=None):
+    """Persist the outcome of run_propagation_chain(): flag each affected
+    downstream period (pending_reprocessing.json), and clear a leftover
+    unresolved flag on each examined downstream period that is no longer
+    affected (its figures again match its own saved close), so a stale
+    flag cannot force a pointless reopen."""
+    kw = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
+    for step in steps[1:]:
+        if step.reprocessing_required:
+            close_history_module.write_pending_reprocessing(step.period_label, reopened_period, **kw)
+        else:
+            rec = close_history_module.read_pending_reprocessing(step.period_label, **kw)
+            if rec is not None and not rec.get("resolved", False):
+                close_history_module.resolve_pending_reprocessing(step.period_label, **kw)
+
+
+def flag_all_closed_downstream(reopened_period, period_order, close_history_module, close_history_dir=None):
+    """Last-resort fail-safe used only if the normal propagation
+    bookkeeping itself failed after the corrected close was saved: flag
+    every later period that has a saved close, so nothing downstream can
+    be closed past unchecked. Best effort; returns the periods flagged."""
+    kw = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
+    flagged = []
+    if reopened_period not in period_order:
+        return flagged
+    for p in period_order[period_order.index(reopened_period) + 1:]:
+        try:
+            if close_history_module.resolve_latest_approved_close_for_period(p, **kw) is not None:
+                close_history_module.write_pending_reprocessing(p, reopened_period, **kw)
+                flagged.append(p)
+        except Exception:
+            continue
+    return flagged

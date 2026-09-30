@@ -1410,6 +1410,47 @@ def fmt_pct(x):
     return f"{x:+.1%}"
 
 
+def pl_prior_values(pl_df, period_col, current_period, prior_period):
+    """Prior-period P&L figures to compare current_period against, as a dict
+    {"revenue","opex","op_profit","margin"}, or None if there is no prior.
+
+    Principal-directed fix (live-testing session): a closed period's own row
+    is frozen at its close (see period_lifecycle.freeze_closed_period_tables),
+    including its QoQ variance columns, which were computed against the prior
+    period AS IT WAS when this period closed. Reading the prior figures from
+    the prior period's OWN row instead silently switched to that period's
+    latest version once it was reopened and corrected, so a never-reopened
+    period was compared with a version of its predecessor that nobody had
+    reviewed alongside it. The prior figures are therefore derived from the
+    current period's own row (level minus its stored variance). For a period
+    that has never been closed the row is live, so this equals the prior
+    period's live row exactly. Falls back to the prior period's row only if
+    the variance columns are unavailable."""
+    cur = pl_df[pl_df[period_col] == current_period].iloc[0]
+    dollar_cols = {
+        "revenue": ("Total Revenue ($)", "Total Revenue QoQ/YoY Var ($)"),
+        "opex": ("Total Opex ($)", "Total Opex QoQ/YoY Var ($)"),
+        "op_profit": ("Operating Profit ($)", "Operating Profit QoQ/YoY Var ($)"),
+    }
+    derived = {}
+    for key, (level_col, var_col) in dollar_cols.items():
+        if var_col in pl_df.columns and level_col in pl_df.columns and pd.notna(cur[var_col]):
+            derived[key] = cur[level_col] - cur[var_col]
+        else:
+            derived = None
+            break
+    if derived is not None and derived["revenue"]:
+        derived["margin"] = derived["op_profit"] / derived["revenue"]
+        return derived
+    if prior_period in pl_df[period_col].values:
+        prior = pl_df[pl_df[period_col] == prior_period].iloc[0]
+        return {
+            "revenue": prior["Total Revenue ($)"], "opex": prior["Total Opex ($)"],
+            "op_profit": prior["Operating Profit ($)"], "margin": prior["Operating Margin (%)"],
+        }
+    return None
+
+
 def build_user_prompt(period_col, period_order, current_period, prior_period, comparison_label,
                        pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
                        exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
@@ -1427,17 +1468,17 @@ def build_user_prompt(period_col, period_order, current_period, prior_period, co
     # component detail per Brief Section 10's "every close, no
     # conditionals" criterion.
     pl_row = pl_df[pl_df[period_col] == current_period].iloc[0]
-    pl_prior_row = pl_df[pl_df[period_col] == prior_period].iloc[0] if prior_period in pl_df[period_col].values else None
+    pl_prior = pl_prior_values(pl_df, period_col, current_period, prior_period)
 
     revenue_current = pl_row["Total Revenue ($)"]
     opex_current = pl_row["Total Opex ($)"]
     op_profit_current = pl_row["Operating Profit ($)"]
     margin_current = pl_row["Operating Margin (%)"]
-    if pl_prior_row is not None:
-        revenue_prior = pl_prior_row["Total Revenue ($)"]
-        opex_prior = pl_prior_row["Total Opex ($)"]
-        op_profit_prior = pl_prior_row["Operating Profit ($)"]
-        margin_prior = pl_prior_row["Operating Margin (%)"]
+    if pl_prior is not None:
+        revenue_prior = pl_prior["revenue"]
+        opex_prior = pl_prior["opex"]
+        op_profit_prior = pl_prior["op_profit"]
+        margin_prior = pl_prior["margin"]
         rev_var_pct = (revenue_current - revenue_prior) / revenue_prior
         opex_var_pct = (opex_current - opex_prior) / opex_prior
     else:
@@ -1446,15 +1487,19 @@ def build_user_prompt(period_col, period_order, current_period, prior_period, co
 
     region_lines = []
     for _, r in rev_region_df[rev_region_df[period_col] == current_period].iterrows():
-        prior_val = rev_region_df[(rev_region_df[period_col] == prior_period) & (rev_region_df["Region"] == r["Region"])]
-        prior_val = prior_val["Revenue ($)"].iloc[0] if not prior_val.empty else np.nan
+        prior_val = r["Prior Period ($)"] if "Prior Period ($)" in rev_region_df.columns else np.nan
+        if pd.isna(prior_val):
+            prior_val = rev_region_df[(rev_region_df[period_col] == prior_period) & (rev_region_df["Region"] == r["Region"])]
+            prior_val = prior_val["Revenue ($)"].iloc[0] if not prior_val.empty else np.nan
         var_pct = (r["Revenue ($)"] - prior_val) / prior_val if pd.notna(prior_val) and prior_val != 0 else np.nan
         region_lines.append(f"  - {r['Region']}: {fmt_money(r['Revenue ($)'])} vs {fmt_money(prior_val)} ({fmt_pct(var_pct)})")
 
     product_lines = []
     for _, r in rev_product_df[rev_product_df[period_col] == current_period].iterrows():
-        prior_val = rev_product_df[(rev_product_df[period_col] == prior_period) & (rev_product_df["Product Line"] == r["Product Line"])]
-        prior_val = prior_val["Revenue ($)"].iloc[0] if not prior_val.empty else np.nan
+        prior_val = r["Prior Period ($)"] if "Prior Period ($)" in rev_product_df.columns else np.nan
+        if pd.isna(prior_val):
+            prior_val = rev_product_df[(rev_product_df[period_col] == prior_period) & (rev_product_df["Product Line"] == r["Product Line"])]
+            prior_val = prior_val["Revenue ($)"].iloc[0] if not prior_val.empty else np.nan
         var_pct = (r["Revenue ($)"] - prior_val) / prior_val if pd.notna(prior_val) and prior_val != 0 else np.nan
         product_lines.append(f"  - {r['Product Line']}: {fmt_money(r['Revenue ($)'])} vs {fmt_money(prior_val)} ({fmt_pct(var_pct)})")
 

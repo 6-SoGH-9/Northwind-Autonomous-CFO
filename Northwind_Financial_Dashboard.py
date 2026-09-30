@@ -101,14 +101,20 @@ def _fmt_close_order_block_message(blocker, target_period):
     all three call sites (the 5.B selection early warning and both
     Approve handlers' hard blocks) render identical text for the same
     underlying block."""
-    blocking = R.fmt_period_label(blocker["blocking_period"])
     target = R.fmt_period_label(target_period)
+    if blocker["reason"] == "control_file_damaged":
+        return (
+            f"Closing {target} is blocked: a close-order control file in Close History is damaged or "
+            f"unreadable, so the close-order state cannot be verified. Repair or restore it, then retry. "
+            f"Detail: {blocker.get('detail', 'unknown')}"
+        )
+    blocking = R.fmt_period_label(blocker["blocking_period"])
     if blocker["reason"] == "never_closed":
         return f"{blocking} is still open. Close it before closing {target}."
     predecessor = R.fmt_period_label(blocker["predecessor"])
     return (
         f"Reopen and close {blocking} before closing {target}. "
-        f"Reopening {predecessor} affected its QoQ."
+        f"Reopening {predecessor} affected {blocking} QoQ."
     )
 
 
@@ -129,6 +135,51 @@ def _find_unresolved_reopen_period():
     """
     if st.session_state.get("reopen_step", 0) in (1, 2, 3):
         return st.session_state.get("reopen_target_period")
+    return None
+
+
+def _narrative_gate_block(scope_quarters):
+    """AI Narrative tab gate (Principal-directed). Returns None if narrative
+    generation / prompt download may be offered for the period(s) in
+    `scope_quarters` (the sidebar quarter, or every quarter of the selected
+    fiscal year under Annual cadence), otherwise the message to show. In
+    priority order a period is blocked when:
+      1. a reopen of it is still in progress (started, not approved or
+         cancelled): the archived version is about to be superseded;
+      2. it is closed but was affected by a later reopen of an earlier
+         period and has not itself been reopened and re-closed (its saved
+         figures are outdated);
+      3. it has no saved close (not approved);
+      4. a close-order control file is damaged (state cannot be verified).
+    Reads Close History and the reopen session slot only; sets nothing."""
+    in_progress = _find_unresolved_reopen_period()
+    if in_progress is not None and in_progress in scope_quarters:
+        return f"{R.fmt_period_label(in_progress)} Reopen closed period is still in progress."
+    damaged = getattr(close_history, "ControlFileError", ())
+    for q in scope_quarters:
+        try:
+            pending = close_history.read_pending_reprocessing(q)
+        except damaged as exc:
+            return (
+                "A close-order control file in Close History is damaged or unreadable, so this "
+                f"period's status cannot be verified. Repair or restore it, then retry. Detail: {exc}"
+            )
+        if pending is not None and not pending.get("resolved", False):
+            return (
+                f"Reopen and close {R.fmt_period_label(q)}. "
+                f"Reopening {R.fmt_period_label(pending['predecessor_period_label'])} "
+                f"affected {R.fmt_period_label(q)} QoQ."
+            )
+    if not scope_quarters or any(
+        close_history.resolve_latest_approved_close_for_period(q) is None for q in scope_quarters
+    ):
+        return (
+            "**This close has not been approved.** Executive narrative generation and the prompt "
+            "download are unavailable until a human approves this close via the Close Approval "
+            "control on the Close Validation Status tab. This applies regardless of Phase 6 "
+            "validation results — an adverse or absent assessment does not block approval, and a "
+            "favorable one does not substitute for it (D13, Human Approval Gate)."
+        )
     return None
 
 
@@ -803,7 +854,12 @@ if cadence == "Annual":
 # Top-line P&L
 # -----------------------------------------------------------------------
 pl_row = pl_df[pl_df[period_col] == current_period].iloc[0]
-pl_prior_row = pl_df[pl_df[period_col] == prior_period].iloc[0] if prior_period in pl_df[period_col].values else None
+# Prior-period comparison figures for the four KPI cards: derived from the
+# current period's own (closed-at-the-time, frozen) row, so a period that was
+# never reopened keeps comparing against its predecessor AS IT WAS when this
+# period closed, even if that predecessor was reopened and corrected since
+# (see rollups.pl_prior_values).
+_pl_prior = R.pl_prior_values(pl_df, period_col, current_period, prior_period)
 
 def _kpi_delta(current, prior, higher_is_good, as_points=False):
     """Return (comparison_str, delta_str, delta_color) for a kpi_card."""
@@ -827,10 +883,10 @@ def _kpi_delta(current, prior, higher_is_good, as_points=False):
     return comp_str, delta_str, color
 
 c1, c2, c3, c4 = st.columns(4)
-prior_rev = pl_prior_row["Total Revenue ($)"] if pl_prior_row is not None else None
-prior_opex = pl_prior_row["Total Opex ($)"] if pl_prior_row is not None else None
-prior_profit = pl_prior_row["Operating Profit ($)"] if pl_prior_row is not None else None
-prior_margin = pl_prior_row["Operating Margin (%)"] if pl_prior_row is not None else None
+prior_rev = _pl_prior["revenue"] if _pl_prior is not None else None
+prior_opex = _pl_prior["opex"] if _pl_prior is not None else None
+prior_profit = _pl_prior["op_profit"] if _pl_prior is not None else None
+prior_margin = _pl_prior["margin"] if _pl_prior is not None else None
 
 with c1:
     comp, delta, color = _kpi_delta(pl_row["Total Revenue ($)"], prior_rev, higher_is_good=True)
@@ -1140,6 +1196,8 @@ with tab_close:
     # between selection and Approve). Procedural only: never sets, clears,
     # or implies Workflow State, Executive Ready, or any other Human
     # Approval Gate (D13) criterion -- this is a caption, nothing else.
+    for _notice in st.session_state.get("close_order_notices", []):
+        st.warning(f"Close-order notice: {_notice}")
     _close_order_blocker = PL.find_close_order_blocker(target_period, R.quarter_order, close_history)
     if _close_order_blocker is not None:
         st.warning(_fmt_close_order_block_message(_close_order_blocker, target_period))
@@ -1622,8 +1680,10 @@ with tab_close:
             with gate_cols[0]:
                 if st.button("Approve close", key="approve_close_btn"):
                     # Section D: available in every state, including re-affirming
-                    # an already-approved close.
-                    _set_close_approval_status_for(target_period, "approved")
+                    # an already-approved close. The "approved" status itself is
+                    # recorded further down, only AFTER both blocking checks
+                    # (close-order, unresolved reopen) have passed -- a blocked
+                    # attempt must leave the approval status untouched.
                     # ---------------------------------------------------------
                     # Gap 4 (builder_brief_operability_gap4_close_durability.md),
                     # Item 1: make this approval durable by calling
@@ -1662,10 +1722,11 @@ with tab_close:
                     # reopen-propagation check, immediately before
                     # archive_close() runs (the 5.B selection control above
                     # is only an early warning; this is the re-check the
-                    # Brief requires at Approve time). Procedural only --
-                    # _set_close_approval_status_for above is untouched by
-                    # this check, and nothing below sets, clears, or
-                    # implies any Human Approval Gate (D13) criterion.
+                    # Brief requires at Approve time). Procedural only -- this
+                    # check runs BEFORE _set_close_approval_status_for(...,
+                    # "approved") below, so a blocked attempt never sets,
+                    # clears, or implies any Human Approval Gate (D13)
+                    # criterion (acceptance criterion 7).
                     _close_order_blocker = PL.find_close_order_blocker(_gap4_period_label, R.quarter_order, close_history)
                     if _close_order_blocker is not None:
                         st.error(_fmt_close_order_block_message(_close_order_blocker, _gap4_period_label))
@@ -1681,6 +1742,10 @@ with tab_close:
                     if _unresolved_reopen is not None:
                         st.error(_fmt_unresolved_reopen_block_message(_unresolved_reopen, _gap4_period_label))
                         st.stop()
+                    # Both blocking checks passed: only now record the
+                    # explicit human approval (same value, same per-period
+                    # setter as before -- merely moved after the checks).
+                    _set_close_approval_status_for(target_period, "approved")
                     try:
                         close_history.archive_close(
                             period_label=_gap4_period_label,
@@ -2696,56 +2761,57 @@ with tab_close:
                                 _cand.get("commentary_records", {})
                             )
 
-                            # D15 Items 3 & 4 -- bootstrap rule (no-op
-                            # unless this is genuinely the very first close
-                            # ever under this rule -- should not normally
-                            # happen via a reopen, since a reopen implies
-                            # _rp was already closed once, but this is
-                            # cheap safety, not a new decision).
-                            close_history.establish_close_order_baseline_if_absent(_rp)
-                            # _rp has now itself been reopened and
-                            # re-closed -- clear any pending_reprocessing.json
-                            # flag it was carrying (Definitions, design note
-                            # §3: resolved iff no such file, or it is
-                            # marked resolved: true).
-                            close_history.resolve_pending_reprocessing(_rp)
+                            # D15 Items 3 & 4 -- post-archive bookkeeping. The
+                            # corrected version is already saved at this point,
+                            # so nothing here may abort half-way and leave
+                            # downstream periods unflagged: a period that cannot
+                            # be compared is treated as affected (E), a leftover
+                            # flag on a period that is no longer affected is
+                            # cleared (F), and any other failure falls back to
+                            # flagging every later closed period. Every case
+                            # is reported to the user, not swallowed.
+                            _close_order_notices = []
+                            try:
+                                # Bootstrap rule (no-op unless this is genuinely
+                                # the very first close ever under this rule).
+                                close_history.establish_close_order_baseline_if_absent(_rp)
+                                # _rp has now itself been reopened and
+                                # re-closed -- clear any pending_reprocessing.json
+                                # flag it was carrying (design note §3).
+                                close_history.resolve_pending_reprocessing(_rp)
 
-                            # 5.G propagation-writing step: walk forward
-                            # from _rp using the ALREADY-BUILT, unmodified
-                            # run_propagation_chain()/reprocessing_required_
-                            # for_downstream() (Category A). compare_fn
-                            # compares each downstream period's OWN
-                            # currently-archived rollups_output.xlsx
-                            # (before) against the workbook just archived
-                            # for _rp's new version (after) -- that
-                            # workbook is rollups.py's full, whole-dataset
-                            # recompute, so it already carries every other
-                            # period's own recalculated QoQ-vs-prior-period
-                            # figures reflecting this correction, without
-                            # those other periods needing to be re-closed
-                            # themselves first. Attribution stays _rp (the
-                            # actual explicit-reopen source) for every hop
-                            # examined in this one pass, per the Message
-                            # Wording section's "the reopen that caused it".
-                            _archived_rollups_path = os.path.join(_archived_folder, "rollups_output.xlsx")
+                                # 5.G propagation-writing step: compare each
+                                # downstream period's OWN currently-archived
+                                # rollups_output.xlsx (before) against the
+                                # workbook just archived for _rp's new version
+                                # (after). Attribution stays _rp for every hop.
+                                _archived_rollups_path = os.path.join(_archived_folder, "rollups_output.xlsx")
 
-                            def _d15_propagation_compare_fn(downstream_period, predecessor_descriptor):
-                                _prior_close = close_history.resolve_latest_approved_close_for_period(downstream_period)
-                                if _prior_close is None:
-                                    # Nothing archived yet for this downstream
-                                    # period to compare against -- not affected.
-                                    return False, predecessor_descriptor
-                                _impact, _ = PL.compare_period_outputs(
-                                    downstream_period, _prior_close["rollups_output_path"], _archived_rollups_path
+                                def _d15_propagation_compare_fn(downstream_period, predecessor_descriptor):
+                                    _prior_close = close_history.resolve_latest_approved_close_for_period(downstream_period)
+                                    if _prior_close is None:
+                                        # Nothing archived yet for this downstream
+                                        # period to compare against -- not affected.
+                                        return False, predecessor_descriptor
+                                    _impact, _ = PL.compare_period_outputs(
+                                        downstream_period, _prior_close["rollups_output_path"], _archived_rollups_path
+                                    )
+                                    return _impact, predecessor_descriptor
+
+                                _propagation_steps = PL.run_propagation_chain(
+                                    _rp, R.quarter_order,
+                                    PL.make_safe_compare_fn(_d15_propagation_compare_fn, _close_order_notices),
                                 )
-                                return _impact, predecessor_descriptor
-
-                            _propagation_steps = PL.run_propagation_chain(
-                                _rp, R.quarter_order, _d15_propagation_compare_fn
-                            )
-                            for _step in _propagation_steps[1:]:
-                                if _step.reprocessing_required:
-                                    close_history.write_pending_reprocessing(_step.period_label, _rp)
+                                PL.apply_propagation_flags(_propagation_steps, _rp, close_history)
+                            except Exception as _bookkeeping_exc:
+                                _fallback_flagged = PL.flag_all_closed_downstream(_rp, R.quarter_order, close_history)
+                                _close_order_notices.append(
+                                    f"Close-order bookkeeping failed after {R.fmt_period_label(_rp)} was saved "
+                                    f"({type(_bookkeeping_exc).__name__}: {_bookkeeping_exc}). As a precaution these "
+                                    f"later periods were flagged for reopen and re-close: "
+                                    f"{', '.join(R.fmt_period_label(p) for p in _fallback_flagged) or 'none had a saved close'}."
+                                )
+                            st.session_state["close_order_notices"] = _close_order_notices
 
                             # Temp files are cleaned up only now that the
                             # candidate is RESOLVED (approved) -- never
@@ -2937,29 +3003,33 @@ with tab_narr:
     # A/E, Criteria 1-3. STRUCTURAL gate, not cosmetic: when the close is
     # not approved, the code paths that call R.call_claude_narrative() and
     # that build the download button simply do not execute at all -- they
-    # sit inside the `if _gate_approved:` branch below, which is False
-    # unless target_period's own approval status (Addendum 3, Item J --
-    # per-period, via _close_approval_status_for(); this tab has no
-    # period selector of its own and reads tab_close's `target_period`,
-    # a plain script-scope variable computed earlier in this same run,
-    # not a Streamlit rerun-dependent lookup) is "approved". There is no
-    # sequence of reruns or widget interactions that reaches either
-    # action without that per-period value having been set to "approved"
-    # first (via the explicit Approve button in the Close Approval Gate,
-    # tab_close -- the only place that sets it). Per D13, no Phase 6
-    # assessment outcome, however favorable, sets or implies this value;
-    # only that explicit human action does.
+    # sit inside the `if _gate_approved:` branch below.
+    #
+    # Principal-directed fix (live-testing session): this gate previously
+    # read the Close Validation Status tab's own `target_period` selector
+    # and the in-session approval flag, so it ignored the sidebar period
+    # this tab's narrative is actually about. It now keys on the sidebar
+    # `current_period` and on Close History (a saved close), with no new
+    # selector on this tab:
+    #   Quarterly: current_period has a saved close in Close History
+    #     (also true for a period closed in an earlier session).
+    #   Annual: every quarter of the selected fiscal year has a saved close.
+    # It is additionally blocked while a reopen of that period is in
+    # progress, and while that period is flagged as affected by a reopen of
+    # an earlier period (see _narrative_gate_block).
+    # A saved close only ever exists after the explicit Approve action
+    # passed the close-order checks, so per D13 no Phase 6 outcome sets or
+    # implies it.
     # ---------------------------------------------------------------------
-    _gate_approved = _close_approval_status_for(target_period) == "approved"
+    _narrative_scope = (
+        [q for q in R.quarter_order if q.endswith(" " + str(current_period))]
+        if cadence == "Annual" else [current_period]
+    )
+    _narrative_block = _narrative_gate_block(_narrative_scope)
+    _gate_approved = _narrative_block is None
 
     if not _gate_approved:
-        st.warning(
-            "**This close has not been approved.** Executive narrative generation and the prompt "
-            "download are unavailable until a human approves this close via the Close Approval "
-            "control on the Close Validation Status tab. This applies regardless of Phase 6 "
-            "validation results — an adverse or absent assessment does not block approval, and a "
-            "favorable one does not substitute for it (D13, Human Approval Gate)."
-        )
+        st.warning(_narrative_block)
     else:
         api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
 

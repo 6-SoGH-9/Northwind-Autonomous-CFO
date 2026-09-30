@@ -451,19 +451,49 @@ BASELINE_FILENAME = "_baseline.json"
 PENDING_REPROCESSING_FILENAME = "pending_reprocessing.json"
 
 
-def read_close_order_baseline(close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
-    """Returns the write-once bootstrap-baseline record
-    {"baseline_period": <label>, "established_at": <iso ts>}, or None if
-    no period has ever closed under this rule yet (close-order enforcement
-    has not started)."""
-    path = os.path.join(close_history_dir, BASELINE_FILENAME)
+class ControlFileError(Exception):
+    """A close-order control file (_baseline.json or a period's
+    pending_reprocessing.json) exists but cannot be trusted: unreadable,
+    truncated, not valid JSON, or missing its required key. Deliberately
+    NOT treated as "file absent": an absent file means "rule not started /
+    period not flagged", whereas a damaged one means the rule state is
+    unknown, so callers must fail safe (block) rather than fail open."""
+
+
+def _read_control_json(path, required_key):
+    """None if the file does not exist; the parsed dict if it is valid;
+    ControlFileError if it exists but is damaged."""
     if not os.path.isfile(path):
         return None
     try:
         with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
+            rec = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise ControlFileError(f"{path} exists but cannot be read ({type(exc).__name__}: {exc}).")
+    if not isinstance(rec, dict) or required_key not in rec:
+        raise ControlFileError(f"{path} exists but is missing its required field '{required_key}'.")
+    return rec
+
+
+def _write_json_atomic(path, record):
+    """Write via a temp file in the same folder, then os.replace(), so a
+    crash mid-write can never leave a truncated control file behind."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(record, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def read_close_order_baseline(close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """Returns the write-once bootstrap-baseline record
+    {"baseline_period": <label>, "established_at": <iso ts>}, or None if
+    no period has ever closed under this rule yet (close-order enforcement
+    has not started). Raises ControlFileError if the file exists but is
+    damaged (never silently treated as absent)."""
+    return _read_control_json(os.path.join(close_history_dir, BASELINE_FILENAME), "baseline_period")
 
 
 def establish_close_order_baseline_if_absent(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
@@ -471,19 +501,18 @@ def establish_close_order_baseline_if_absent(period_label, close_history_dir=DEF
     any period closes under this rule — recording period_label as the
     permanent baseline. A no-op returning the EXISTING record, unchanged,
     if a baseline already exists: never overwritten, recomputed, or moved
-    afterward, per the confirmed bootstrap rule. This function only
-    writes the record; it is the caller's responsibility to call it only
-    on a close attempt's own success, never speculatively."""
+    afterward, per the confirmed bootstrap rule. A DAMAGED existing
+    baseline raises ControlFileError and is never overwritten. This
+    function only writes the record; it is the caller's responsibility to
+    call it only on a close attempt's own success, never speculatively."""
     existing = read_close_order_baseline(close_history_dir)
     if existing is not None:
         return existing
-    os.makedirs(close_history_dir, exist_ok=True)
     record = {
         "baseline_period": period_label,
         "established_at": datetime.now(timezone.utc).isoformat(),
     }
-    with open(os.path.join(close_history_dir, BASELINE_FILENAME), "w") as f:
-        json.dump(record, f, indent=2)
+    _write_json_atomic(os.path.join(close_history_dir, BASELINE_FILENAME), record)
     return record
 
 
@@ -493,50 +522,43 @@ def _pending_reprocessing_path(period_label, close_history_dir=DEFAULT_CLOSE_HIS
 
 def read_pending_reprocessing(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
     """Returns period_label's sidecar dict, or None if it has never been
-    flagged as reopen-affected. Does NOT itself apply the Definitions
-    "resolved" test (design note §3) — a returned dict may carry
-    resolved: true; callers deciding blocking status should treat
-    resolved: true the same as no record at all."""
-    path = _pending_reprocessing_path(period_label, close_history_dir)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
+    flagged as reopen-affected. Raises ControlFileError if the file exists
+    but is damaged. Does NOT itself apply the Definitions "resolved" test
+    (design note §3) — a returned dict may carry resolved: true; callers
+    deciding blocking status should treat resolved: true the same as no
+    record at all."""
+    return _read_control_json(
+        _pending_reprocessing_path(period_label, close_history_dir), "predecessor_period_label"
+    )
 
 
 def write_pending_reprocessing(period_label, predecessor_period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
     """5.G propagation-writing step: mark period_label as affected by an
     upstream reopen and not yet resolved, naming the reopened predecessor
-    that caused it. Overwrites any existing (e.g. already-resolved) record
-    for period_label — a period can be re-flagged by a later, independent
-    reopen after a prior flag was resolved."""
-    folder = os.path.join(close_history_dir, period_label)
-    os.makedirs(folder, exist_ok=True)
+    that caused it. Overwrites any existing (e.g. already-resolved or
+    damaged) record for period_label — a period can be re-flagged by a
+    later, independent reopen after a prior flag was resolved."""
     record = {
         "period_label": period_label,
         "predecessor_period_label": predecessor_period_label,
         "flagged_at": datetime.now(timezone.utc).isoformat(),
         "resolved": False,
     }
-    with open(_pending_reprocessing_path(period_label, close_history_dir), "w") as f:
-        json.dump(record, f, indent=2)
+    _write_json_atomic(_pending_reprocessing_path(period_label, close_history_dir), record)
     return record
 
 
 def resolve_pending_reprocessing(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
     """Mark period_label's pending_reprocessing.json resolved: true —
-    called when that period is itself reopened and re-closed. A no-op
-    (returns None) if no such record exists for period_label."""
+    called when that period is itself reopened and re-closed, or when a
+    later re-close shows it is no longer affected. A no-op (returns None)
+    if no such record exists for period_label."""
     rec = read_pending_reprocessing(period_label, close_history_dir)
     if rec is None:
         return None
     rec["resolved"] = True
     rec["resolved_at"] = datetime.now(timezone.utc).isoformat()
-    with open(_pending_reprocessing_path(period_label, close_history_dir), "w") as f:
-        json.dump(rec, f, indent=2)
+    _write_json_atomic(_pending_reprocessing_path(period_label, close_history_dir), rec)
     return rec
 
 
