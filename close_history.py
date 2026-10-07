@@ -35,6 +35,7 @@ import os
 import glob
 import json
 import shutil
+import stat
 import subprocess
 from datetime import datetime, timezone
 
@@ -387,7 +388,7 @@ def archive_close(
     # v1, breaking the "one immutable record per version" guarantee.
     if version == 1 and _is_legacy_unversioned_snapshot(period_folder):
         raise FileExistsError(
-            f"Close History snapshot '{period_label}' already exists (as a legacy, "
+            f"Close History snapshot '{_display_label(period_label)}' already exists (as a legacy, "
             f"pre-D15 unversioned v1) at {period_folder} — snapshots are immutable "
             "and must not be overwritten. Use resolve_version(period_label, 1) to "
             "read it, or archive_close(..., version=2) to record a correction."
@@ -395,7 +396,7 @@ def archive_close(
     folder = os.path.join(period_folder, f"v{version}")
     if os.path.isdir(folder):
         raise FileExistsError(
-            f"Close History snapshot '{period_label}' version {version} already exists at "
+            f"Close History snapshot '{_display_label(period_label)}' version {version} already exists at "
             f"{folder} — snapshots are immutable and must not be overwritten."
         )
     os.makedirs(folder, exist_ok=False)
@@ -516,8 +517,134 @@ def establish_close_order_baseline_if_absent(period_label, close_history_dir=DEF
     return record
 
 
+# -----------------------------------------------------------------------
+# Fix K ("No flag, no approval", brief v2.3): attempt record on marks.
+# A mark written during a reopen-and-correct approval attempt carries four
+# OPTIONAL fields (attempt_id, reopened_period, expected_version,
+# prior_state). Marks without attempt_id (old files, post-save resolved
+# marks) behave exactly as before.
+# -----------------------------------------------------------------------
+
+def _display_label(period):
+    """Display-only 'Q3 FY2026' -> 'Q3 2026' (mirror of rollups.fmt_period_label,
+    which this module does not import). v2.4 A3: messages never show a
+    'Q# FY####' label; folder paths are unaffected."""
+    import re
+    m = re.match(r"^(Q[1-4]) FY(\d{4})$", period) if isinstance(period, str) else None
+    return f"{m.group(1)} {m.group(2)}" if m else period
+
+
+ATTEMPT_FIELDS = ("attempt_id", "reopened_period", "expected_version", "prior_state", "attempt_at")
+
+# D6 (Principal-approved): how long an unmatched mark is treated as "in
+# doubt" (the attempt may still be running) before M7 may release it. The
+# time is NOT the evidence of abandonment; the missing save is.
+PENDING_GRACE_SECONDS = 15 * 60
+
+
+def _utcnow():
+    """Single clock for M7 so tests can inject time."""
+    return datetime.now(timezone.utc)
+
+
 def _pending_reprocessing_path(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
     return os.path.join(close_history_dir, period_label, PENDING_REPROCESSING_FILENAME)
+
+
+def read_pending_mark_raw(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """The mark file exactly as stored (no M7 evaluation). None if absent;
+    ControlFileError if damaged. Used for read-back verification and by the
+    evaluation itself."""
+    return _read_control_json(
+        _pending_reprocessing_path(period_label, close_history_dir), "predecessor_period_label"
+    )
+
+
+def _scan_for_matching_save(reopened_period, attempt_id, close_history_dir):
+    """"saved" if a COMPLETE version folder (readable metadata.json) of
+    reopened_period carries attempt_id; "none" if the folder was listed and
+    read cleanly and no such save exists; "unknown" if anything could not be
+    listed or read (caller must fail safe). A version folder with no
+    metadata.json is an incomplete save and is ignored (same as every
+    existing reader)."""
+    period_folder = os.path.join(close_history_dir, reopened_period)
+    try:
+        entries = os.listdir(period_folder)
+    except OSError:
+        return "unknown"
+    unknown = False
+    for entry in entries:
+        if not entry.startswith("v"):
+            continue
+        try:
+            int(entry[1:])
+        except ValueError:
+            continue  # e.g. "v2.incomplete-<ts>" (moved aside) or unrelated
+        vfolder = os.path.join(period_folder, entry)
+        try:
+            if not stat.S_ISDIR(os.stat(vfolder).st_mode):
+                continue  # a plain file cannot hold a save
+        except OSError:
+            unknown = True
+            continue
+        try:
+            with open(os.path.join(vfolder, "metadata.json")) as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            continue  # incomplete version folder: no save
+        except (OSError, ValueError, UnicodeDecodeError):
+            unknown = True
+            continue
+        if isinstance(meta, dict) and meta.get("attempt_id") == attempt_id:
+            return "saved"
+    return "unknown" if unknown else "none"
+
+
+def _evaluate_mark(rec, close_history_dir):
+    """M7 rule. Returns (effective_record_or_None, status) where status is
+    one of: "legacy" (no attempt_id: returned unchanged), "saved",
+    "in_doubt", "released" (no save established; effective record is the
+    prior state), "flagged_prior_damaged" (no save established but the
+    prior file was damaged: stays flagged, fail-safe).
+
+    PRODUCTION-STORAGE NOTE (Principal footnote, Fix K Addendum
+    2026-10-01): this rule assumes a write either fully completes or fully
+    fails with no partial-visibility window, as on the Codespace file
+    system. It MUST be explicitly revisited if the project moves to
+    different storage (network or object storage with delayed visibility),
+    which could release a mark too early or leave a quarter stuck.
+
+    Pure read: never deletes or rewrites anything."""
+    attempt_id = rec.get("attempt_id")
+    if not attempt_id:
+        return rec, "legacy"
+    reopened = rec.get("reopened_period") or rec.get("predecessor_period_label")
+    scan = _scan_for_matching_save(reopened, attempt_id, close_history_dir) if reopened else "unknown"
+    # 1. matching complete save -> the save happened, forever.
+    if scan == "saved":
+        return rec, "saved"
+    # 2. younger than the grace period -> in doubt. v2.4 A2: the grace is
+    # measured from attempt_at; flagged_at is used only when attempt_at is
+    # absent (a mark written without it).
+    try:
+        started = datetime.fromisoformat(rec["attempt_at"] if rec.get("attempt_at") else rec.get("flagged_at"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        age = (_utcnow() - started).total_seconds()
+    except (TypeError, ValueError):
+        return rec, "in_doubt"
+    if age < PENDING_GRACE_SECONDS:
+        return rec, "in_doubt"
+    # 3. folder could not be listed/read -> in doubt (fail safe).
+    if scan != "none":
+        return rec, "in_doubt"
+    # 4. established: no save occurred. Return the prior state.
+    prior = rec.get("prior_state")
+    if isinstance(prior, dict) and prior.get("kind") == "none":
+        return None, "released"
+    if isinstance(prior, dict) and prior.get("kind") == "mark" and isinstance(prior.get("record"), dict):
+        return prior["record"], "released"
+    return rec, "flagged_prior_damaged"
 
 
 def read_pending_reprocessing(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
@@ -526,38 +653,201 @@ def read_pending_reprocessing(period_label, close_history_dir=DEFAULT_CLOSE_HIST
     but is damaged. Does NOT itself apply the Definitions "resolved" test
     (design note §3) — a returned dict may carry resolved: true; callers
     deciding blocking status should treat resolved: true the same as no
-    record at all."""
-    return _read_control_json(
-        _pending_reprocessing_path(period_label, close_history_dir), "predecessor_period_label"
-    )
+    record at all.
+
+    Fix K (M7): a mark carrying an attempt_id is evaluated here, at the one
+    place every reader goes through. If it is established that the attempt's
+    correction was never saved, the mark's prior state is returned as if the
+    attempt never happened. Marks without attempt_id are returned exactly as
+    stored."""
+    rec = read_pending_mark_raw(period_label, close_history_dir)
+    if rec is None:
+        return None
+    effective, _status = _evaluate_mark(rec, close_history_dir)
+    return effective
 
 
-def write_pending_reprocessing(period_label, predecessor_period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+def released_pending_marks(period_order, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """M11 / D8: the marks currently evaluated as released (no save
+    established), oldest period first, as
+    [{"period", "reopened_period", "attempt_id"}]. A damaged file or an
+    in-doubt/saved mark is never listed."""
+    out = []
+    for p in period_order:
+        try:
+            rec = read_pending_mark_raw(p, close_history_dir)
+        except ControlFileError:
+            continue
+        if rec is None:
+            continue
+        _eff, status = _evaluate_mark(rec, close_history_dir)
+        if status == "released":
+            out.append({
+                "period": p,
+                "reopened_period": rec.get("reopened_period") or rec.get("predecessor_period_label"),
+                "attempt_id": rec.get("attempt_id"),
+            })
+    return out
+
+
+def capture_pending_state(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """Snapshot of period_label's mark file before an attempt touches it:
+    {"kind": "none"|"mark"|"damaged", "record": dict|None, "raw": bytes|None}.
+    "raw" is the exact file content (for byte-for-byte undo); kind/record
+    are what goes into the mark's prior_state. If the existing file is an
+    attempt mark that is not (yet) a proven save (in doubt or released),
+    the capture takes ITS prior_state, ignoring that attempt."""
+    path = _pending_reprocessing_path(period_label, close_history_dir)
+    if not os.path.lexists(path):
+        return {"kind": "none", "record": None, "raw": None}
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {"kind": "damaged", "record": None, "raw": None}
+    try:
+        rec = read_pending_mark_raw(period_label, close_history_dir)
+    except ControlFileError:
+        return {"kind": "damaged", "record": None, "raw": raw}
+    if rec is None:
+        return {"kind": "none", "record": None, "raw": raw}
+    if rec.get("attempt_id"):
+        _eff, status = _evaluate_mark(rec, close_history_dir)
+        if status != "saved":
+            prior = rec.get("prior_state")
+            if isinstance(prior, dict) and prior.get("kind") == "none":
+                return {"kind": "none", "record": None, "raw": raw}
+            if isinstance(prior, dict) and prior.get("kind") == "mark" and isinstance(prior.get("record"), dict):
+                return {"kind": "mark", "record": prior["record"], "raw": raw}
+            return {"kind": "damaged", "record": None, "raw": raw}
+    return {"kind": "mark", "record": rec, "raw": raw}
+
+
+def _attempt_block(attempt, prior_state):
+    if not attempt:
+        return {}
+    ps = {"kind": "none"}
+    if prior_state is not None:
+        ps = {"kind": prior_state["kind"]}
+        if prior_state.get("record") is not None:
+            ps["record"] = prior_state["record"]
+    return {
+        "attempt_id": attempt["attempt_id"],
+        "reopened_period": attempt["reopened_period"],
+        "expected_version": attempt["expected_version"],
+        "prior_state": ps,
+        # v2.4 A2: the attempt's own time (grace period starts here, so
+        # flagged_at can stay the mark's original value on a Fix F clear).
+        "attempt_at": attempt.get("attempt_at") or _utcnow().isoformat(),
+    }
+
+
+def write_pending_reprocessing(period_label, predecessor_period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR,
+                               attempt=None, prior_state=None):
     """5.G propagation-writing step: mark period_label as affected by an
     upstream reopen and not yet resolved, naming the reopened predecessor
     that caused it. Overwrites any existing (e.g. already-resolved or
     damaged) record for period_label — a period can be re-flagged by a
-    later, independent reopen after a prior flag was resolved."""
+    later, independent reopen after a prior flag was resolved.
+
+    Fix K: optional attempt = {"attempt_id", "reopened_period",
+    "expected_version"} plus prior_state (from capture_pending_state) add the
+    attempt record. Without them the record is exactly as before."""
     record = {
         "period_label": period_label,
         "predecessor_period_label": predecessor_period_label,
-        "flagged_at": datetime.now(timezone.utc).isoformat(),
+        "flagged_at": _utcnow().isoformat(),
         "resolved": False,
     }
+    record.update(_attempt_block(attempt, prior_state))
     _write_json_atomic(_pending_reprocessing_path(period_label, close_history_dir), record)
     return record
+
+
+def write_attempt_resolved_pending_reprocessing(period_label, current_record, attempt, prior_state,
+                                                close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """Fix F clear performed as part of a Fix K attempt: the same resolved
+    state resolve_pending_reprocessing() would write, but carrying the
+    attempt record so it is restorable (M3/M5)."""
+    rec = {k: v for k, v in current_record.items() if k not in ATTEMPT_FIELDS}
+    rec["resolved"] = True
+    rec["resolved_at"] = _utcnow().isoformat()
+    # v2.4 A2: flagged_at is left exactly as the mark had it (as 691e8f4's
+    # resolve does); the attempt's time is in attempt_at.
+    rec.update(_attempt_block(attempt, prior_state))
+    _write_json_atomic(_pending_reprocessing_path(period_label, close_history_dir), rec)
+    return rec
+
+
+def restore_pending_state(period_label, snapshot, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """M5 undo for one quarter: put the file back exactly as captured
+    (delete it if there was none), then compare. Returns None on success or
+    an error string. A DAMAGED prior file is deliberately NOT restored: the
+    attempt's own mark is left in place, so the quarter stays flagged
+    (fail-safe). Never raises."""
+    path = _pending_reprocessing_path(period_label, close_history_dir)
+    try:
+        if snapshot["kind"] == "damaged":
+            return None
+        # Already exactly the prior state (e.g. the attempt's write failed
+        # before changing anything): nothing to undo.
+        if snapshot["raw"] is None and not os.path.lexists(path):
+            return None
+        if snapshot["raw"] is not None and os.path.isfile(path):
+            with open(path, "rb") as f:
+                if f.read() == snapshot["raw"]:
+                    return None
+        if snapshot["raw"] is None:
+            if os.path.lexists(path):
+                os.remove(path)
+            if os.path.lexists(path):
+                return "file still present after undo"
+            return None
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(snapshot["raw"])
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        with open(path, "rb") as f:
+            if f.read() != snapshot["raw"]:
+                return "restored file does not match its prior content"
+        return None
+    except Exception as exc:  # noqa: BLE001 - undo must never raise (M5)
+        return f"{type(exc).__name__}: {exc}"
+
+
+def move_aside_incomplete_version(period_label, version, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
+    """M6 (D7): rename -- never delete -- an incomplete version folder so a
+    retry can create it. Only a DIRECTORY named v<version> that has no
+    metadata.json. Returns the new path, or None if nothing was moved."""
+    folder = os.path.join(close_history_dir, period_label, f"v{version}")
+    if not os.path.isdir(folder) or os.path.lexists(os.path.join(folder, "metadata.json")):
+        return None
+    stamp = _utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    target = f"{folder}.incomplete-{stamp}"
+    os.rename(folder, target)
+    return target
 
 
 def resolve_pending_reprocessing(period_label, close_history_dir=DEFAULT_CLOSE_HISTORY_DIR):
     """Mark period_label's pending_reprocessing.json resolved: true —
     called when that period is itself reopened and re-closed, or when a
     later re-close shows it is no longer affected. A no-op (returns None)
-    if no such record exists for period_label."""
-    rec = read_pending_reprocessing(period_label, close_history_dir)
-    if rec is None:
+    if no such record exists for period_label.
+
+    Fix K: attempt fields are dropped from the resolved record (it becomes
+    a plain resolved mark, exactly the pre-Fix-K shape). A mark that M7
+    evaluates as released is also given this plain resolved record, so the
+    orphaned file is replaced (never deleted) and the D8 notice stops."""
+    raw = read_pending_mark_raw(period_label, close_history_dir)
+    if raw is None:
         return None
+    effective, _status = _evaluate_mark(raw, close_history_dir)
+    base = effective if effective is not None else raw
+    rec = {k: v for k, v in base.items() if k not in ATTEMPT_FIELDS}
     rec["resolved"] = True
-    rec["resolved_at"] = datetime.now(timezone.utc).isoformat()
+    rec["resolved_at"] = _utcnow().isoformat()
     _write_json_atomic(_pending_reprocessing_path(period_label, close_history_dir), rec)
     return rec
 

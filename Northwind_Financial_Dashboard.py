@@ -119,6 +119,141 @@ def _fmt_close_order_block_message(blocker, target_period):
     )
 
 
+def _fixk_released_notice_text(released):
+    """M11 / D8: the release notice for one released mark
+    ({"period", "reopened_period", ...} from close_history.released_pending_marks)."""
+    return (
+        f"An earlier approval of {R.fmt_period_label(released['reopened_period'])} did not complete; "
+        f"no correction was saved and {R.fmt_period_label(released['period'])} is no longer marked."
+    )
+
+
+def _fmt_scope_violation_line(v):
+    """One line of the correction-scope violation list (pre-existing text;
+    v2.4 A3: the period is shown as 'Q3 2026', never 'Q3 FY2026')."""
+    return (
+        f"- **{v['sheet']} / {R.fmt_period_label(v['period'])}** {v['key']}"
+        + (f" — field `{v.get('field')}`: currently approved = {v.get('approved_value')}, "
+           f"uploaded = {v.get('uploaded_value')}"
+           if "field" in v else f" — {v['issue']}")
+    )
+
+
+def _fixk_clear_failure_notices(attempt):
+    """W3 (brief v2.4, Message Wording; D4): one notice per quarter whose
+    outdated flag could not be cleared. Exact approved text, no prefix."""
+    out = []
+    for c in attempt.get("clear_failures", []):
+        q3 = R.fmt_period_label(c["period"])
+        out.append({"exact": (
+            f"An outdated flag on {q3} could not be cleared ({c['error']}). "
+            f"{q3} stays blocked until it is reopened and re-closed."
+        )})
+    return out
+
+
+def _fixk_render_notice(notice):
+    """A notice is a plain string (shown with the existing 'Close-order
+    notice:' prefix) or {"exact": text} (an approved message, shown as is)."""
+    if isinstance(notice, dict):
+        st.warning(notice["exact"])
+    else:
+        st.warning(f"Close-order notice: {notice}")
+
+
+def _fixk_render_failure(reopened_period, attempt):
+    """Fix K (M8): render a refused or failed approval. The texts are the
+    Principal-approved W1, W2, W4 and W5 of brief v2.4 (Message Wording,
+    authoritative); W3 is rendered by _fixk_clear_failure_notices."""
+    q2 = R.fmt_period_label(reopened_period)
+    if attempt["outcome"] == "refused_marks":
+        fails = attempt["failures"]
+        if len(fails) == 1:
+            # W1 (one quarter).
+            st.error(
+                f"{q2} was NOT saved. {R.fmt_period_label(fails[0]['period'])} could not be marked as "
+                f"outdated ({fails[0]['error']}), so the correction was refused. Fix the cause shown "
+                "above (for example folder permissions or disk space) and approve again."
+            )
+        else:
+            # W2 (several quarters, list, oldest first).
+            items = "\n".join(f"- {R.fmt_period_label(f['period'])} ({f['error']})" for f in fails)
+            st.error(
+                f"{q2} was NOT saved. The correction was refused because these quarters could not be "
+                f"marked as outdated:\n{items}\n\nFix the cause shown above (for example folder "
+                "permissions or disk space) and approve again. The oldest quarter is listed first."
+            )
+    elif attempt["outcome"] == "save_failed":
+        # W4: one message, no claim about flags.
+        st.error(
+            f"{q2} was NOT saved. The save failed ({attempt['save_error']}). Fix the cause shown above "
+            "(for example folder permissions or disk space) and approve again."
+        )
+    for u in attempt.get("undo_failures", []):
+        # W5, once per affected quarter, below W4 when the save failed.
+        q3 = R.fmt_period_label(u["period"])
+        st.error(
+            f"The approval of {q2} did not complete, but a flag for {q3} from this attempt could not be "
+            f"undone ({u['detail']}). {q3} stays blocked for narrative and later closes until a later "
+            f"approval of {q2} completes, the storage problem is fixed and the mark is released, or "
+            f"{q3} is reopened and re-closed. Other tabs still show {q3} figures without any warning."
+        )
+    for n in _fixk_clear_failure_notices(attempt):
+        _fixk_render_notice(n)
+    for n in attempt.get("notices", []):
+        _fixk_render_notice(n)
+
+
+def _fixk_list_text(labels):
+    """'A', 'A and B', 'A, B and C' (no serial comma), in the order given."""
+    if len(labels) <= 1:
+        return "".join(labels)
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
+
+
+def _fixk_fallback_notice_text(reopened_period, outcomes):
+    """N1 (brief v2.5, Message Wording): the post-save fallback notice.
+    Plain text; the display code adds the 'Close-order notice: ' prefix."""
+    q2 = R.fmt_period_label(reopened_period)
+    marked = [R.fmt_period_label(o["period"]) for o in outcomes if o["outcome"] == "flagged"]
+    nosave = [R.fmt_period_label(o["period"]) for o in outcomes if o["outcome"] == "no saved close"]
+    if not outcomes:
+        return f"{q2} was saved. No later quarter exists, so nothing was marked."
+    parts = []
+    if marked:
+        many = len(marked) > 1
+        parts.append(
+            f'As a precaution, {_fixk_list_text(marked)} {"are" if many else "is"} marked "may be outdated". '
+            f'Reopen and re-close {"them" if many else "it"}{" in that order" if many else ""}.'
+        )
+    if nosave:
+        parts.append(f'{_fixk_list_text(nosave)} {"have" if len(nosave) > 1 else "has"} no saved close, '
+                     "so nothing was marked.")
+    return f"{q2} was saved. " + " ".join(parts)
+
+
+def _fixk_bookkeeping_notice_text(reopened_period, failure):
+    """N2: one notice per failed follow-up step after a saved approval."""
+    q2 = R.fmt_period_label(reopened_period)
+    what = ("recording the close order" if failure["step"] == "baseline"
+            else f'clearing the "may be outdated" mark on {q2} itself')
+    return (f"{q2} was saved. A follow-up step failed: {what} ({failure['error']}). "
+            "The saved version is complete.")
+
+
+def _fixk_success_notices(reopened_period, attempt):
+    """Fix K: notices to show after a SAVED approval (failed clears under
+    D4 = W3, comparison / check notices N3 and N5 and N4, the fallback
+    notice N1, and failed follow-up steps N2 under M9)."""
+    out = _fixk_clear_failure_notices(attempt) + list(attempt.get("notices", []))
+    fb = attempt.get("fallback_outcomes")
+    if fb is not None:
+        out.append(_fixk_fallback_notice_text(reopened_period, fb))
+    for failure in attempt.get("post_save_failures", []):
+        out.append(_fixk_bookkeeping_notice_text(reopened_period, failure))
+    return out
+
+
 def _find_unresolved_reopen_period():
     """Principal-directed extension (post-D15-Items-3&4 delivery, live-
     testing finding): a reopen that has been requested and/or confirmed
@@ -1249,7 +1384,21 @@ with tab_close:
     # or implies Workflow State, Executive Ready, or any other Human
     # Approval Gate (D13) criterion -- this is a caption, nothing else.
     for _notice in st.session_state.get("close_order_notices", []):
-        st.warning(f"Close-order notice: {_notice}")
+        _fixk_render_notice(_notice)
+    # Fix K (M11 / D8, Principal decision): a mark released because its
+    # approval never saved is NOT silent. Shown here until the Controller
+    # dismisses it; dismissal is per browser session only (it changes no
+    # mark, no file and no other reader).
+    _dismissed_released = st.session_state.setdefault("released_mark_notices_dismissed", set())
+    _visible_released = [
+        _r for _r in close_history.released_pending_marks(R.quarter_order)
+        if (_r["period"], _r["attempt_id"]) not in _dismissed_released
+    ]
+    for _r in _visible_released:
+        st.warning(_fixk_released_notice_text(_r))
+    if _visible_released and st.button("Dismiss", key="dismiss_released_mark_notices_btn"):
+        _dismissed_released.update((_r["period"], _r["attempt_id"]) for _r in _visible_released)
+        st.rerun()
     _close_order_blocker = PL.find_close_order_blocker(target_period, R.quarter_order, close_history)
     if _close_order_blocker is not None:
         st.warning(_fmt_close_order_block_message(_close_order_blocker, target_period))
@@ -2457,13 +2606,7 @@ with tab_close:
 
             if _scope_pending_here:
                 _pv = st.session_state["correction_scope_pending"]
-                _violation_lines = "\n".join(
-                    f"- **{v['sheet']} / {v['period']}** {v['key']}"
-                    + (f" — field `{v.get('field')}`: currently approved = {v.get('approved_value')}, "
-                       f"uploaded = {v.get('uploaded_value')}"
-                       if "field" in v else f" — {v['issue']}")
-                    for v in _pv["violations"]
-                )
+                _violation_lines = "\n".join(_fmt_scope_violation_line(v) for v in _pv["violations"])
                 st.warning(
                     f"These values fall outside {R.fmt_period_label(_rp)} and will not be captured in "
                     f"this close:\n\n{_violation_lines}"
@@ -2662,6 +2805,7 @@ with tab_close:
                                 "or remove it before approving."
                             )
                             st.stop()
+                        _fixk_refused = False
                         try:
                             # Item F (D15-Item2-Corrections Addendum 1) --
                             # zero-net-change guard. Blocks BEFORE any
@@ -2754,6 +2898,24 @@ with tab_close:
                                 _cand["phase2_result"], _cand["phase3_result"], R.fmt_period_label, CV.STATUS_OK
                             )
 
+                            # Fix K (brief v2.3, 'No flag, no approval'): marks are written and
+                            # verified BEFORE the correction is saved. If a required mark cannot
+                            # be saved and read back, nothing is saved and this attempt's marks
+                            # are undone. Comparison reads the CANDIDATE's own rollups file
+                            # (nothing is archived yet; archive_close copies it byte for byte).
+                            _candidate_rollups_path = _cand["rollups_output_path"]
+
+                            def _d15_propagation_compare_fn(downstream_period, predecessor_descriptor):
+                                _prior_close = close_history.resolve_latest_approved_close_for_period(downstream_period)
+                                if _prior_close is None:
+                                    # Nothing archived yet for this downstream
+                                    # period to compare against -- not affected.
+                                    return False, predecessor_descriptor
+                                _impact, _ = PL.compare_period_outputs(
+                                    downstream_period, _prior_close["rollups_output_path"], _candidate_rollups_path
+                                )
+                                return _impact, predecessor_descriptor
+
                             # The ONE archive_close() call site for this
                             # candidate. Correction 5, UPDATED by Addendum
                             # 1 Item E: commentary_record is now whatever
@@ -2764,174 +2926,138 @@ with tab_close:
                             # uses -- rather than always None. Still
                             # honestly {} (not fabricated) when nothing was
                             # entered this session.
-                            _archived_folder, _archived_meta = close_history.archive_close(
-                                period_label=_rp,
-                                raw_dataset_src=_cand["raw_dataset_path"],
-                                rollups_output_src=_cand["rollups_output_path"],
-                                observations_df=_candidate_obs_df,
-                                narrative_text="",
-                                phase2_flag_count=len(_cand["phase2_result"].flagged_rows),
-                                phase3_flag_count=len(_cand["phase3_result"].flagged_rows),
-                                workflow_state="Executive Ready",
-                                prior_close_period_label=_candidate_prior_period_label,
-                                commentary_record=CWF.serialize_commentary_records(_cand.get("commentary_records", {})),
-                                version=_candidate_version,
-                                extra_metadata=PL.build_lineage_metadata(
-                                    trigger=PL.TRIGGER_EXPLICIT_REOPEN,
-                                    comparison_result=_cand["comparison"],
-                                    # Item A audit trail (Addendum 1):
-                                    # persisted into the archived record,
-                                    # not only shown once in the UI.
-                                    excluded_out_of_period_rows=_cand.get("excluded_out_of_period_rows"),
-                                ),
-                            )
-                            st.session_state["reopen_candidate_approval_status"] = "approved"
-
-                            # Principal-directed fix (live-testing session):
-                            # the reopen candidate keeps its OWN commentary_
-                            # records dict (_cand["commentary_records"]),
-                            # entirely separate from the top-level
-                            # st.session_state["commentary_records"] that the
-                            # workflow-state strip (Explanations Validated),
-                            # the closed-period read-only Commentary Review
-                            # view, and the Narrative tab all read from.
-                            # Nothing ever copied the candidate's dict back
-                            # into the top-level one -- it was archived
-                            # correctly to Close History (via
-                            # serialize_commentary_records just above) and
-                            # then discarded a few lines below when
-                            # "reopen_candidate" is popped from session
-                            # state, so a correction's accepted commentary
-                            # durably existed on disk but was invisible
-                            # everywhere else in this session: the narrative
-                            # reported it as "commentary process attempted
-                            # but no accepted explanation currently exists",
-                            # and "Explanations Validated" stayed unchecked,
-                            # even though the Controller had already written
-                            # and accepted it. Confirmed live (both by
-                            # reproducing it directly and independently by
-                            # you hitting the identical symptom).
-                            #
-                            # A plain dict.update() is sufficient and safe: a
-                            # stale key from a superseded observation (e.g. a
-                            # prior version's flag that the correction
-                            # resolved and which no longer appears in the
-                            # current observation register) is never looked
-                            # up by ID against anything but the CURRENT
-                            # register everywhere it's consumed
-                            # (_render_commentary_review_records skips a
-                            # non-matching oid; the workflow-state strip's
-                            # open-uncommented count is a set difference
-                            # against the current register's own IDs;
-                            # build_narrative_commentary_section iterates the
-                            # current register's flagged rows, never the
-                            # commentary dict's keys) -- so it becomes
-                            # harmlessly inert rather than wrong.
-                            st.session_state["commentary_records"].update(
-                                _cand.get("commentary_records", {})
-                            )
-
-                            # D15 Items 3 & 4 -- post-archive bookkeeping. The
-                            # corrected version is already saved at this point,
-                            # so nothing here may abort half-way and leave
-                            # downstream periods unflagged: a period that cannot
-                            # be compared is treated as affected (E), a leftover
-                            # flag on a period that is no longer affected is
-                            # cleared (F), and any other failure falls back to
-                            # flagging every later closed period. Every case
-                            # is reported to the user, not swallowed.
-                            _close_order_notices = []
-                            try:
-                                # Bootstrap rule (no-op unless this is genuinely
-                                # the very first close ever under this rule).
-                                close_history.establish_close_order_baseline_if_absent(_rp)
-                                # _rp has now itself been reopened and
-                                # re-closed -- clear any pending_reprocessing.json
-                                # flag it was carrying (design note §3).
-                                close_history.resolve_pending_reprocessing(_rp)
-
-                                # 5.G propagation-writing step: compare each
-                                # downstream period's OWN currently-archived
-                                # rollups_output.xlsx (before) against the
-                                # workbook just archived for _rp's new version
-                                # (after). Attribution stays _rp for every hop.
-                                _archived_rollups_path = os.path.join(_archived_folder, "rollups_output.xlsx")
-
-                                def _d15_propagation_compare_fn(downstream_period, predecessor_descriptor):
-                                    _prior_close = close_history.resolve_latest_approved_close_for_period(downstream_period)
-                                    if _prior_close is None:
-                                        # Nothing archived yet for this downstream
-                                        # period to compare against -- not affected.
-                                        return False, predecessor_descriptor
-                                    _impact, _ = PL.compare_period_outputs(
-                                        downstream_period, _prior_close["rollups_output_path"], _archived_rollups_path
-                                    )
-                                    return _impact, predecessor_descriptor
-
-                                _propagation_steps = PL.run_propagation_chain(
-                                    _rp, R.quarter_order,
-                                    PL.make_safe_compare_fn(_d15_propagation_compare_fn, _close_order_notices),
+                            def _fixk_archive(_attempt_id):
+                                return close_history.archive_close(
+                                    period_label=_rp,
+                                    raw_dataset_src=_cand["raw_dataset_path"],
+                                    rollups_output_src=_cand["rollups_output_path"],
+                                    observations_df=_candidate_obs_df,
+                                    narrative_text="",
+                                    phase2_flag_count=len(_cand["phase2_result"].flagged_rows),
+                                    phase3_flag_count=len(_cand["phase3_result"].flagged_rows),
+                                    workflow_state="Executive Ready",
+                                    prior_close_period_label=_candidate_prior_period_label,
+                                    commentary_record=CWF.serialize_commentary_records(_cand.get("commentary_records", {})),
+                                    version=_candidate_version,
+                                    extra_metadata=dict(attempt_id=_attempt_id, **PL.build_lineage_metadata(
+                                        trigger=PL.TRIGGER_EXPLICIT_REOPEN,
+                                        comparison_result=_cand["comparison"],
+                                        # Item A audit trail (Addendum 1):
+                                        # persisted into the archived record,
+                                        # not only shown once in the UI.
+                                        excluded_out_of_period_rows=_cand.get("excluded_out_of_period_rows"),
+                                    )),
                                 )
-                                PL.apply_propagation_flags(_propagation_steps, _rp, close_history)
-                            except Exception as _bookkeeping_exc:
-                                _fallback_flagged = PL.flag_all_closed_downstream(_rp, R.quarter_order, close_history)
-                                _close_order_notices.append(
-                                    f"Close-order bookkeeping failed after {R.fmt_period_label(_rp)} was saved "
-                                    f"({type(_bookkeeping_exc).__name__}: {_bookkeeping_exc}). As a precaution these "
-                                    f"later periods were flagged for reopen and re-close: "
-                                    f"{', '.join(R.fmt_period_label(p) for p in _fallback_flagged) or 'none had a saved close'}."
-                                )
-                            st.session_state["close_order_notices"] = _close_order_notices
 
-                            # Temp files are cleaned up only now that the
-                            # candidate is RESOLVED (approved) -- never
-                            # earlier.
-                            if _cand.get("persist_dir"):
-                                shutil.rmtree(_cand["persist_dir"], ignore_errors=True)
-                            # Item B (D15-Item2-Corrections Brief, OI-9/
-                            # OI-12): same fix as the live single-period
-                            # Approve handler -- force rollups.py to
-                            # re-resolve so Close Validation Status
-                            # correctly reflects this candidate's
-                            # correction without a manual restart.
-                            importlib.reload(R)
-                            _archived_version_msg = (
-                                f"✅ Archived {R.fmt_period_label(_rp)} as v{_candidate_version} at {_archived_folder}."
+                            _attempt = PL.run_reopen_approval_attempt(
+                                _rp, R.quarter_order, close_history, _d15_propagation_compare_fn, _fixk_archive,
+                                _candidate_version,
                             )
-                            # Item G (Addendum 2/3): reset both reopen
-                            # uploaders on a successful approve.
-                            st.session_state["reopen_uploader_generation"] = (
-                                st.session_state.get("reopen_uploader_generation", 0) + 1
-                            )
-                            # Live-testing bug fix: previously the candidate
-                            # (st.session_state["reopen_candidate"]) was left
-                            # in place after a successful approve, so the
-                            # persistent Item H summary block kept rendering
-                            # the SAME "Candidate built for..." banner it
-                            # showed before this click -- nothing on the page
-                            # visibly changed, since the one-time "Archived
-                            # as vN" confirmation below is rendered on this
-                            # same pass and then discarded by st.rerun() a
-                            # few lines down, exactly the flash Item H was
-                            # built to fix for the build summary, but this
-                            # success message was never given the same
-                            # treatment. Clearing the candidate here lets
-                            # Item K's own top-level check correctly show
-                            # this period as "already closed" on the very
-                            # next render -- the natural, unambiguous
-                            # confirmation that this succeeded, no separate
-                            # message channel needed. st.toast() (unlike
-                            # st.success()) is specifically designed to
-                            # survive exactly one st.rerun(), so the
-                            # confirmation itself is not lost either.
-                            st.session_state.pop("reopen_candidate", None)
-                            st.session_state["reopen_step"] = 0
-                            st.session_state["reopen_target_period"] = None
-                            st.session_state.pop("reopen_candidate_approval_status", None)
-                            st.toast(_archived_version_msg, icon="✅")
+                            _fixk_refused = _attempt["outcome"] != "saved"
+                            if _fixk_refused:
+                                _fixk_render_failure(_rp, _attempt)
+                            else:
+                                _archived_folder, _archived_meta = _attempt["archived"]
+                                st.session_state["reopen_candidate_approval_status"] = "approved"
+
+                                # Principal-directed fix (live-testing session):
+                                # the reopen candidate keeps its OWN commentary_
+                                # records dict (_cand["commentary_records"]),
+                                # entirely separate from the top-level
+                                # st.session_state["commentary_records"] that the
+                                # workflow-state strip (Explanations Validated),
+                                # the closed-period read-only Commentary Review
+                                # view, and the Narrative tab all read from.
+                                # Nothing ever copied the candidate's dict back
+                                # into the top-level one -- it was archived
+                                # correctly to Close History (via
+                                # serialize_commentary_records just above) and
+                                # then discarded a few lines below when
+                                # "reopen_candidate" is popped from session
+                                # state, so a correction's accepted commentary
+                                # durably existed on disk but was invisible
+                                # everywhere else in this session: the narrative
+                                # reported it as "commentary process attempted
+                                # but no accepted explanation currently exists",
+                                # and "Explanations Validated" stayed unchecked,
+                                # even though the Controller had already written
+                                # and accepted it. Confirmed live (both by
+                                # reproducing it directly and independently by
+                                # you hitting the identical symptom).
+                                #
+                                # A plain dict.update() is sufficient and safe: a
+                                # stale key from a superseded observation (e.g. a
+                                # prior version's flag that the correction
+                                # resolved and which no longer appears in the
+                                # current observation register) is never looked
+                                # up by ID against anything but the CURRENT
+                                # register everywhere it's consumed
+                                # (_render_commentary_review_records skips a
+                                # non-matching oid; the workflow-state strip's
+                                # open-uncommented count is a set difference
+                                # against the current register's own IDs;
+                                # build_narrative_commentary_section iterates the
+                                # current register's flagged rows, never the
+                                # commentary dict's keys) -- so it becomes
+                                # harmlessly inert rather than wrong.
+                                st.session_state["commentary_records"].update(
+                                    _cand.get("commentary_records", {})
+                                )
+
+                                # Fix K step 7 results: reported, never hidden (M9).
+                                st.session_state["close_order_notices"] = _fixk_success_notices(_rp, _attempt)
+
+
+                                # Temp files are cleaned up only now that the
+                                # candidate is RESOLVED (approved) -- never
+                                # earlier.
+                                if _cand.get("persist_dir"):
+                                    shutil.rmtree(_cand["persist_dir"], ignore_errors=True)
+                                # Item B (D15-Item2-Corrections Brief, OI-9/
+                                # OI-12): same fix as the live single-period
+                                # Approve handler -- force rollups.py to
+                                # re-resolve so Close Validation Status
+                                # correctly reflects this candidate's
+                                # correction without a manual restart.
+                                importlib.reload(R)
+                                _archived_version_msg = (
+                                    f"✅ Archived {R.fmt_period_label(_rp)} as v{_candidate_version} at {_archived_folder}."
+                                )
+                                # Item G (Addendum 2/3): reset both reopen
+                                # uploaders on a successful approve.
+                                st.session_state["reopen_uploader_generation"] = (
+                                    st.session_state.get("reopen_uploader_generation", 0) + 1
+                                )
+                                # Live-testing bug fix: previously the candidate
+                                # (st.session_state["reopen_candidate"]) was left
+                                # in place after a successful approve, so the
+                                # persistent Item H summary block kept rendering
+                                # the SAME "Candidate built for..." banner it
+                                # showed before this click -- nothing on the page
+                                # visibly changed, since the one-time "Archived
+                                # as vN" confirmation below is rendered on this
+                                # same pass and then discarded by st.rerun() a
+                                # few lines down, exactly the flash Item H was
+                                # built to fix for the build summary, but this
+                                # success message was never given the same
+                                # treatment. Clearing the candidate here lets
+                                # Item K's own top-level check correctly show
+                                # this period as "already closed" on the very
+                                # next render -- the natural, unambiguous
+                                # confirmation that this succeeded, no separate
+                                # message channel needed. st.toast() (unlike
+                                # st.success()) is specifically designed to
+                                # survive exactly one st.rerun(), so the
+                                # confirmation itself is not lost either.
+                                st.session_state.pop("reopen_candidate", None)
+                                st.session_state["reopen_step"] = 0
+                                st.session_state["reopen_target_period"] = None
+                                st.session_state.pop("reopen_candidate_approval_status", None)
+                                st.toast(_archived_version_msg, icon="✅")
                         except FileExistsError as _err:
                             st.error(str(_err))
-                        st.rerun()
+                        if not _fixk_refused:
+                                st.rerun()
                 with _gate_c2:
                     if st.button("Reject candidate", key="reject_candidate_close_btn"):
                         # Status change only. No archive call. No other

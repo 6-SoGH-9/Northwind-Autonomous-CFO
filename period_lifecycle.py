@@ -1256,6 +1256,19 @@ def find_close_order_blocker(target_period, period_order, close_history_module, 
 # D15 Items 3 & 4 -- safe post-archive propagation bookkeeping (E and F).
 # -----------------------------------------------------------------------
 
+def display_period_label(period):
+    """Display-only: 'Q3 FY2026' -> 'Q3 2026' (same rule as
+    rollups.fmt_period_label, which this module cannot import: importing
+    rollups runs the pipeline). A standalone 'FY2026' or any other text is
+    returned unchanged. v2.4 A3: no user-visible message may carry a
+    'Q# FY####' label."""
+    import re
+    if not isinstance(period, str):
+        return period
+    m = re.match(r"^(Q[1-4]) FY(\d{4})$", period)
+    return f"{m.group(1)} {m.group(2)}" if m else period
+
+
 def make_safe_compare_fn(compare_fn, notices):
     """Wrap a run_propagation_chain() compare_fn so that a downstream
     period that cannot be compared (e.g. its archived workbook predates
@@ -1269,43 +1282,278 @@ def make_safe_compare_fn(compare_fn, notices):
             return compare_fn(period_label, predecessor_descriptor)
         except Exception as exc:
             notices.append(
-                f"{period_label} could not be compared with the corrected figures "
-                f"({type(exc).__name__}: {exc}); it has been treated as affected."
+                f"{display_period_label(period_label)} could not be compared with the corrected figures "
+                f"({type(exc).__name__}: {exc}). It is treated as affected."
             )
             return True, predecessor_descriptor
     return _safe
 
 
-def apply_propagation_flags(steps, reopened_period, close_history_module, close_history_dir=None):
+def _ledger_entry(ledger, period, action, attempt, close_history_module, kw):
+    """Fix K: one ledger entry per quarter touched by an attempt. The
+    snapshot (state before the FIRST write of this attempt) is captured once
+    and reused if the same quarter is written again (e.g. by the fallback)."""
+    entry = ledger.get(period)
+    if entry is None:
+        entry = {"period": period, "action": action, "status": "pending", "error": None,
+                 "snapshot": None, "record": None}
+        ledger[period] = entry
+        try:
+            entry["snapshot"] = close_history_module.capture_pending_state(period, **kw)
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            entry["status"] = "failed"
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            entry["snapshot_failed"] = True
+    else:
+        entry["action"] = action
+    return entry
+
+
+def apply_propagation_flags(steps, reopened_period, close_history_module, close_history_dir=None,
+                            attempt=None, ledger=None):
     """Persist the outcome of run_propagation_chain(): flag each affected
     downstream period (pending_reprocessing.json), and clear a leftover
     unresolved flag on each examined downstream period that is no longer
     affected (its figures again match its own saved close), so a stale
-    flag cannot force a pointless reopen."""
+    flag cannot force a pointless reopen.
+
+    Fix K: with attempt (and a ledger dict) every write carries the attempt
+    record and is logged in the ledger with its pre-write snapshot; a failed
+    write is recorded, not raised, so the caller can verify, refuse and undo.
+    Without attempt the behaviour is exactly as before."""
     kw = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
+    if attempt is None:
+        for step in steps[1:]:
+            if step.reprocessing_required:
+                close_history_module.write_pending_reprocessing(step.period_label, reopened_period, **kw)
+            else:
+                rec = close_history_module.read_pending_reprocessing(step.period_label, **kw)
+                if rec is not None and not rec.get("resolved", False):
+                    close_history_module.resolve_pending_reprocessing(step.period_label, **kw)
+        return ledger
+
+    if ledger is None:
+        ledger = {}
     for step in steps[1:]:
+        p = step.period_label
         if step.reprocessing_required:
-            close_history_module.write_pending_reprocessing(step.period_label, reopened_period, **kw)
+            entry = _ledger_entry(ledger, p, "flag", attempt, close_history_module, kw)
+            if entry.get("snapshot_failed"):
+                continue
+            try:
+                entry["record"] = close_history_module.write_pending_reprocessing(
+                    p, reopened_period, attempt=attempt, prior_state=entry["snapshot"], **kw)
+                entry["status"] = "flagged"
+            except Exception as exc:  # noqa: BLE001
+                entry["status"] = "failed"
+                entry["error"] = f"{type(exc).__name__}: {exc}"
         else:
-            rec = close_history_module.read_pending_reprocessing(step.period_label, **kw)
-            if rec is not None and not rec.get("resolved", False):
-                close_history_module.resolve_pending_reprocessing(step.period_label, **kw)
+            rec = close_history_module.read_pending_reprocessing(p, **kw)
+            # M11: an examined quarter whose mark file M7 evaluates as
+            # released (no save established) is also replaced by this
+            # attempt (as a resolved record, never deleted), so the D8
+            # notice stops once a later approval has touched the quarter.
+            released = bool(close_history_module.released_pending_marks([p], **kw))
+            if (rec is not None and not rec.get("resolved", False)) or released:
+                base = rec if rec is not None else close_history_module.read_pending_mark_raw(p, **kw)
+                entry = _ledger_entry(ledger, p, "clear", attempt, close_history_module, kw)
+                if entry.get("snapshot_failed"):
+                    continue
+                try:
+                    entry["record"] = close_history_module.write_attempt_resolved_pending_reprocessing(
+                        p, base, attempt, entry["snapshot"], **kw)
+                    entry["status"] = "cleared"
+                except Exception as exc:  # noqa: BLE001
+                    entry["status"] = "failed"
+                    entry["error"] = f"{type(exc).__name__}: {exc}"
+    return ledger
 
 
-def flag_all_closed_downstream(reopened_period, period_order, close_history_module, close_history_dir=None):
+def flag_all_closed_downstream(reopened_period, period_order, close_history_module, close_history_dir=None,
+                               attempt=None, ledger=None):
     """Last-resort fail-safe used only if the normal propagation
-    bookkeeping itself failed after the corrected close was saved: flag
-    every later period that has a saved close, so nothing downstream can
-    be closed past unchecked. Best effort; returns the periods flagged."""
+    bookkeeping itself failed: flag every later period that has a saved
+    close, so nothing downstream can be closed past unchecked.
+
+    M1 (Fix K): returns an EXPLICIT outcome per later quarter -- never a
+    silent skip:
+        {"period", "outcome": "flagged" | "failed" | "no saved close", "error"}
+    "no saved close" is reported only for a quarter whose check succeeded and
+    found none; a quarter whose check or write raised is "failed" (with
+    error type and message)."""
     kw = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
-    flagged = []
+    outcomes = []
     if reopened_period not in period_order:
-        return flagged
+        return outcomes
+    if ledger is None:
+        ledger = {}
     for p in period_order[period_order.index(reopened_period) + 1:]:
         try:
-            if close_history_module.resolve_latest_approved_close_for_period(p, **kw) is not None:
-                close_history_module.write_pending_reprocessing(p, reopened_period, **kw)
-                flagged.append(p)
-        except Exception:
+            has_close = close_history_module.resolve_latest_approved_close_for_period(p, **kw) is not None
+        except Exception as exc:  # noqa: BLE001
+            outcomes.append({"period": p, "outcome": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            # A quarter whose check failed must still be protected if it
+            # has a close: try to flag it, and let verification decide.
+            if attempt is not None:
+                entry = _ledger_entry(ledger, p, "flag", attempt, close_history_module, kw)
+                entry["status"] = "failed"
+                entry["error"] = f"{type(exc).__name__}: {exc}"
             continue
-    return flagged
+        if not has_close:
+            outcomes.append({"period": p, "outcome": "no saved close", "error": None})
+            continue
+        if attempt is None:
+            try:
+                close_history_module.write_pending_reprocessing(p, reopened_period, **kw)
+                outcomes.append({"period": p, "outcome": "flagged", "error": None})
+            except Exception as exc:  # noqa: BLE001
+                outcomes.append({"period": p, "outcome": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        entry = _ledger_entry(ledger, p, "flag", attempt, close_history_module, kw)
+        if entry.get("snapshot_failed"):
+            outcomes.append({"period": p, "outcome": "failed", "error": entry["error"]})
+            continue
+        try:
+            entry["record"] = close_history_module.write_pending_reprocessing(
+                p, reopened_period, attempt=attempt, prior_state=entry["snapshot"], **kw)
+            entry["status"] = "flagged"
+            entry["error"] = None
+            outcomes.append({"period": p, "outcome": "flagged", "error": None})
+        except Exception as exc:  # noqa: BLE001
+            entry["status"] = "failed"
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            outcomes.append({"period": p, "outcome": "failed", "error": entry["error"]})
+    return outcomes
+
+
+# -----------------------------------------------------------------------
+# Fix K (brief v2.3) -- "No flag, no approval" for reopen-and-correct.
+# Order: compare -> write marks -> read back -> (refuse+undo | save) ->
+# post-save steps. UI-agnostic: the dashboard supplies the comparison and
+# the archive call and renders the outcome.
+# -----------------------------------------------------------------------
+
+def verify_attempt_marks(ledger, close_history_module, close_history_dir=None):
+    """M4: read every mark written by this attempt back from disk and compare
+    it with what was written. A mismatch or unreadable file turns that
+    entry into status "failed". Returns the ledger."""
+    kw = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
+    for entry in ledger.values():
+        if entry["status"] not in ("flagged", "cleared"):
+            continue
+        try:
+            on_disk = close_history_module.read_pending_mark_raw(entry["period"], **kw)
+        except Exception as exc:  # noqa: BLE001
+            entry["status"] = "failed"
+            entry["error"] = f"read-back failed ({type(exc).__name__}: {exc})"
+            continue
+        if on_disk != entry["record"]:
+            entry["status"] = "failed"
+            entry["error"] = "read-back did not match what was written"
+    return ledger
+
+
+def undo_attempt_marks(ledger, close_history_module, close_history_dir=None):
+    """M5: restore every quarter this attempt touched to its exact prior
+    state. Returns [{"period", "detail"}] for each undo that failed. Never
+    raises."""
+    kw = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
+    failures = []
+    for entry in ledger.values():
+        snap = entry.get("snapshot")
+        if snap is None:
+            continue  # nothing was written for this quarter
+        detail = close_history_module.restore_pending_state(entry["period"], snap, **kw)
+        if detail is not None:
+            failures.append({"period": entry["period"], "detail": detail})
+    return failures
+
+
+def run_reopen_approval_attempt(reopened_period, period_order, close_history_module, compare_fn, archive_fn,
+                                expected_version, close_history_dir=None, attempt_id=None):
+    """Fix K core. compare_fn(downstream_period, descriptor) -> (impact,
+    descriptor) must compare against the CANDIDATE's rollups file (nothing is
+    archived yet). archive_fn(attempt_id) -> (folder, metadata) performs the
+    one archive_close() call with attempt_id in the saved close's metadata.
+
+    Returns a dict:
+      outcome: "saved" | "refused_marks" | "save_failed"
+      attempt_id, ledger, notices (propagation + D4 + post-save lines),
+      clear_failures [{"period","error"}] (D4: a failed Fix F clear, rendered
+      as W3), failures [{"period","error"}] (required flag marks that were not saved
+      and verified), undo_failures [{"period","detail"}], save_error,
+      moved_aside, archived (folder, metadata) , post_save_failures [{"step": "baseline"|"own flag", "error"}]."""
+    import uuid
+    kw = {"close_history_dir": close_history_dir} if close_history_dir is not None else {}
+    attempt_id = attempt_id or uuid.uuid4().hex
+    attempt = {"attempt_id": attempt_id, "reopened_period": reopened_period, "expected_version": expected_version,
+               "attempt_at": close_history_module._utcnow().isoformat()}
+    ledger = {}
+    notices = []
+    result = {"attempt_id": attempt_id, "ledger": ledger, "notices": notices, "failures": [],
+              "undo_failures": [], "save_error": None, "moved_aside": None, "archived": None,
+              "post_save_failures": [], "clear_failures": [], "outcome": None}
+
+    # Steps 2-4: compare against the candidate, write marks, read back.
+    try:
+        steps = run_propagation_chain(reopened_period, period_order, make_safe_compare_fn(compare_fn, notices))
+        apply_propagation_flags(steps, reopened_period, close_history_module, close_history_dir,
+                                attempt=attempt, ledger=ledger)
+    except Exception as exc:  # noqa: BLE001 - normal path raised: use the fallback
+        outcomes = flag_all_closed_downstream(reopened_period, period_order, close_history_module,
+                                              close_history_dir, attempt=attempt, ledger=ledger)
+        result["fallback_outcomes"] = outcomes
+        notices.append(
+            f"The check of later quarters failed ({type(exc).__name__}: {exc}). Every later quarter with a "
+            "saved close is treated as affected."
+        )
+    verify_attempt_marks(ledger, close_history_module, close_history_dir)
+
+    def _ordered(entries):
+        return sorted(entries, key=lambda e: period_order.index(e["period"]) if e["period"] in period_order else 0)
+
+    failed = _ordered(e for e in ledger.values() if e["status"] == "failed")
+    required_failed = [e for e in failed if e["action"] == "flag"]
+    # D4: a failed CLEAR does not refuse; it fails safe (the mark stays
+    # unresolved, so the quarter over-blocks) and is reported.
+    for e in failed:
+        if e["action"] == "clear":
+            result["clear_failures"].append({"period": e["period"], "error": e["error"]})
+
+    # Step 5: refuse -- archive_close is never called.
+    if required_failed:
+        result["failures"] = [{"period": e["period"], "error": e["error"]} for e in required_failed]
+        result["undo_failures"] = undo_attempt_marks(ledger, close_history_module, close_history_dir)
+        result["outcome"] = "refused_marks"
+        return result
+
+    # Step 6: save.
+    try:
+        result["archived"] = archive_fn(attempt_id)
+    except Exception as exc:  # noqa: BLE001
+        result["save_error"] = f"{type(exc).__name__}: {exc}"
+        result["undo_failures"] = undo_attempt_marks(ledger, close_history_module, close_history_dir)
+        try:
+            result["moved_aside"] = close_history_module.move_aside_incomplete_version(
+                reopened_period, expected_version, **kw)
+        except Exception as move_exc:  # noqa: BLE001
+            notices.append(f"The incomplete folder for {display_period_label(reopened_period)} (v{expected_version}) "
+                           f"could not be moved aside ({type(move_exc).__name__}: {move_exc}). "
+                           "It is not a saved version.")
+        result["outcome"] = "save_failed"
+        return result
+
+    # Step 7: post-save. Reported, never relied on for protection, never
+    # changes the outcome "saved" (M9).
+    for label, fn in (
+        ("baseline", lambda: close_history_module.establish_close_order_baseline_if_absent(reopened_period, **kw)),
+        ("own flag", lambda: close_history_module.resolve_pending_reprocessing(reopened_period, **kw)),
+    ):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            # v2.5 (N2): step name and error kept apart so the dashboard can
+            # word each notice; when/whether a step runs is unchanged.
+            result["post_save_failures"].append({"step": label, "error": f"{type(exc).__name__}: {exc}"})
+    result["outcome"] = "saved"
+    return result
