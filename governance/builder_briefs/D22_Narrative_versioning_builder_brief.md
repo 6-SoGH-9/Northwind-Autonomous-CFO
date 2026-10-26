@@ -1,6 +1,6 @@
-# D22 Narrative Versioning, Number Check and Flags: Builder Brief v3 (for Principal review; NOT RELEASED)
+# D22 Narrative Versioning, Number Check and Flags: Builder Brief v3 (SIGNED BY THE PRINCIPAL, 2026-10-26)
 
-**STATUS: DRAFT FOR PRINCIPAL REVIEW. NOT RELEASED. The Builder must not start until the Principal Approval Gate in Part 3 is signed (Gate rule; Principal close-out message of 2026-10-15, section 4 (3)).**
+**STATUS: SIGNED BY THE PRINCIPAL, 2026-10-26 (Part 3 signature block). The text below the signature lines is the text the Principal reviewed (SHA-256 `eecbf42989964f64aea3f163a18cc8d1437bc4731a4297fc2ca5e46f7c372365`, the unsigned v3 committed in `1e2f44c`). Only this status line, the title, the Gate ticks, the signature and the release rule differ from it.** The Principal makes it canonical and sends it to the Builder. The Builder does not start until this signed file is on canonical `main`. The committed path is `governance/builder_briefs/D22_Narrative_versioning_builder_brief.md`; the Brief ID in the header below is unchanged. Briefs v1 and v2 were never released and are superseded by this file.
 **Brief ID:** `d22_narrative_versioning_builder_brief_v3` (proposed path: `governance/builder_briefs/d22_narrative_versioning_builder_brief_v3.md`; v1 and v2 were never released and are superseded by this file; ID assigned by the Architect, the Principal may override).
 **Date drafted:** 2026-10-26 (v2 and v3 the same day, after the Advisor's two reviews).
 **v3 changes from v2 (Advisor note of 2026-10-26, six small fixes, each verified by the Architect; no scope, decision or evidence class changed):** (1) Part 1 section 3, line B, now says Category E, as the Gate does; (2) "four points" corrected to five in Part 0 and Part 1 section 1; (3) a block "If Gate decision 1 is (b)" lists exactly what drops out and what remains; (4) Required evidence is split by release in a table; (5) the consequence of an undeletable draft folder is stated as accepted (WP2-10); (6) the Annual fix is classified the same way in Category A, Part 0 and Gate decision 2.
@@ -288,25 +288,25 @@ No genuine conflict identified.
 These are NOT Builder-authorized scope unless the Principal approves them. Under the close-out default rule the Brief builds to them and says so.
 | Recommendation | Reason | Principal Authorization |
 |---|---|---|
-| `narratives` folder, type-prefixed names, state file not named `metadata.json` | Cannot collide with close-version discovery | ☐ Not authorized / ☐ Approved as built-to |
-| One record per close version; derived draft counter, no stored counter | Mark written in one place; restart is automatic | ☐ Not authorized / ☐ Approved as built-to |
-| History entry carries its kind | Readable without comparing times | ☐ Not authorized / ☐ Approved as built-to |
-| Label "Finalize narrative" and finals with no deck in this release (moved from Category D: the reason is the Principal's deferral of deck content, not a technical limit) | No deck can be built; no rebuild exists | ☐ Not authorized / ☐ Approved as built-to (Gate decision 1) |
-| Quarterly-only new flow (moved from Category D: Annual cadence is Deferred by the Principal) | Annual has no single close version | ☐ Not authorized / ☐ Approved as built-to (Gate decision 4) |
-| Editable region is the "Your own notes" section only | D22-B (1), (2), (2a) read together | ☐ Not authorized / ☐ Approved as built-to |
-| Mark badge not using the word "final" | "final" has two meanings | ☐ Not authorized / ☐ Approved as built-to |
-| Default view: narrative with selector | Not stated by the Principal | ☐ Not authorized / ☐ Approved as built-to |
-| Long-list presentation: searchable selector grouped by DATA section | Left to the Brief by D22-G (B3) | ☐ Not authorized / ☐ Approved as built-to |
-| Name asked again each session | Reading of "once per session" | ☐ Not authorized / ☐ Approved as built-to |
-| G1 to G4 defaults (table above) | D22-H (13) | ☐ Not authorized / ☐ Approved as built-to |
+| `narratives` folder, type-prefixed names, state file not named `metadata.json` | Cannot collide with close-version discovery | ☐ Not authorized / ☑ Approved as built-to |
+| One record per close version; derived draft counter, no stored counter | Mark written in one place; restart is automatic | ☐ Not authorized / ☑ Approved as built-to |
+| History entry carries its kind | Readable without comparing times | ☐ Not authorized / ☑ Approved as built-to |
+| Label "Finalize narrative" and finals with no deck in this release (moved from Category D: the reason is the Principal's deferral of deck content, not a technical limit) | No deck can be built; no rebuild exists | ☐ Not authorized / ☑ Approved as built-to (Gate decision 1) |
+| Quarterly-only new flow (moved from Category D: Annual cadence is Deferred by the Principal) | Annual has no single close version | ☐ Not authorized / ☑ Approved as built-to (Gate decision 4) |
+| Editable region is the "Your own notes" section only | D22-B (1), (2), (2a) read together | ☐ Not authorized / ☑ Approved as built-to |
+| Mark badge not using the word "final" | "final" has two meanings | ☐ Not authorized / ☑ Approved as built-to |
+| Default view: narrative with selector | Not stated by the Principal | ☐ Not authorized / ☑ Approved as built-to |
+| Long-list presentation: searchable selector grouped by DATA section | Left to the Brief by D22-G (B3) | ☐ Not authorized / ☑ Approved as built-to |
+| Name asked again each session | Reading of "once per session" | ☐ Not authorized / ☑ Approved as built-to |
+| G1 to G4 defaults (table above) | D22-H (13) | ☐ Not authorized / ☑ Approved as built-to |
 
 ## PRINCIPAL DECISIONS AT THE GATE
 These five are not minor. Tick one option in each.
-1. Finalized narratives in this release have no deck, and no rebuild exists: ☐ accept (recommended) ☐ hold the finalize action, the mark and the history until the deck Brief (what drops out: Part 2, "If Gate decision 1 is (b)").
-2. The Annual commentary-source fix (a decided requirement, D22-B (10), Category A): ☐ I confirm the Architect's reading that the Deferred "Annual cadence" does not override it, so it stays in scope ☐ I read the deferral as covering it, so it is removed from WP1-2.
-3. Release: ☐ staged, Release 1 = WP1 + WP3, Release 2 = WP2, WP4, WP5 (recommended) ☐ all at once.
-4. The Quarterly-only flow and the "Your own notes" editable region (TASK text and system prompt not editable): ☐ approved ☐ changed as follows: ________
-5. The defaults G1 to G4 and the name-prompt details: ☐ approved ☐ changed as follows: ________
+1. Finalized narratives in this release have no deck, and no rebuild exists: ☑ accept (recommended) ☐ hold the finalize action, the mark and the history until the deck Brief (what drops out: Part 2, "If Gate decision 1 is (b)").
+2. The Annual commentary-source fix (a decided requirement, D22-B (10), Category A): ☑ I confirm the Architect's reading that the Deferred "Annual cadence" does not override it, so it stays in scope ☐ I read the deferral as covering it, so it is removed from WP1-2.
+3. Release: ☑ staged, Release 1 = WP1 + WP3, Release 2 = WP2, WP4, WP5 (recommended) ☐ all at once.
+4. The Quarterly-only flow and the "Your own notes" editable region (TASK text and system prompt not editable): ☑ approved ☐ changed as follows: ________
+5. The defaults G1 to G4 and the name-prompt details: ☑ approved ☐ changed as follows: ________
 
 ## EXPLICIT EXCLUSIONS
 | Exclusion | Reason | Authority |
@@ -331,16 +331,16 @@ These five are not minor. Tick one option in each.
 ## PRINCIPAL APPROVAL GATE
 I confirm that:
 
-☐ This Brief includes ALL requirements I have decided.
-☐ This Brief includes NO product scope I did not authorize.
-☐ The exclusions accurately represent my deferred/out-of-scope decisions.
-☐ The Architect has not silently narrowed my authorized scope. (The one change of wording, the label of the second action, and its consequence, are stated in Part 0 item 1 and decided at Gate decision 1.)
-☐ The Architect has not silently expanded my authorized scope.
-☐ Architect recommendations are clearly separated from mandatory scope.
-☐ I understand that Builder implements ONLY the authorized scope in this Brief.
-☐ If the Brief is incomplete, I will request clarification before issuing it.
+☑ This Brief includes ALL requirements I have decided.
+☑ This Brief includes NO product scope I did not authorize.
+☑ The exclusions accurately represent my deferred/out-of-scope decisions.
+☑ The Architect has not silently narrowed my authorized scope. (The one change of wording, the label of the second action, and its consequence, are stated in Part 0 item 1 and decided at Gate decision 1.)
+☑ The Architect has not silently expanded my authorized scope.
+☑ Architect recommendations are clearly separated from mandatory scope.
+☑ I understand that Builder implements ONLY the authorized scope in this Brief.
+☑ If the Brief is incomplete, I will request clarification before issuing it.
 
-**Approved by Principal:** ______________________   **Date:** ______________________
+**Approved by Principal:** by written statement in the session on 2026-10-26, 11:47 Europe/London: "I confirmed it but did not confirm the handbook", confirming the Gate answers relayed in his message of the same day (prepared by the Project Advisor): decision 1 accept; decision 2 confirmed in scope; decision 3 staged; decision 4 approved; decision 5 approved; all Category E rows approved as built-to; all eight boxes ticked; his quoted messages of 2026-10-15 and 2026-10-26 confirmed accurate. Recorded by the Architect. The Principal did **not** confirm any Handbook update; none is requested by this Brief.   **Date:** 2026-10-26
 
 ## ARCHITECT ATTESTATION
 I confirm:
@@ -357,4 +357,4 @@ I confirm:
 **Architect:** Claude (Architect)   **Date:** 2026-10-26
 
 ## RELEASE RULE
-The Builder Brief is **NOT RELEASED** until the Principal Approval Gate is explicitly approved. The Architect's attestation does not substitute for Principal authorization. The Architect has not pushed, merged or sent anything.
+The Principal Approval Gate was approved on 2026-10-26 (signature block above). Release to the Builder is the Principal's act: the Brief is released when the Principal makes this signed file canonical and sends it. The Architect's attestation does not substitute for Principal authorization. The Architect has not pushed, merged or sent anything.
