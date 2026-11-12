@@ -1028,6 +1028,71 @@ def _chrono_index(obj):
     obj.index = pd.Categorical(obj.index, categories=_chrono_labels, ordered=True)
     return obj
 
+
+def _chart_with_table_tooltip(chart_type, data, unit):
+    """Draw `data` exactly as st.line_chart(data) / st.bar_chart(data) would,
+    except that the hover tooltip's value row shows the text the tables show
+    for the same value (Chart Tooltip Display Format Brief v2, 2026-11-11; the
+    one shared display helper authorized in its Gate Category E).
+
+    - The chart is built by the same Streamlit builder, with the same
+      arguments, that st.line_chart / st.bar_chart use (Streamlit 1.60.0), so
+      the plotted x, y and series fields, colours, stacking, ordering, axes,
+      titles and scales are unchanged.
+    - The text is produced here in Python by the table's own rules, not by the
+      chart library's number format: "${:,.0f}" for dollars (unit "$"),
+      fmt_pct_half for percentages stored as fractions (unit "%"), and blank
+      for a missing value (the tables' na_rep="").
+    - It travels as one extra tooltip-only column. The tooltip keeps the same
+      rows and titles ("index", "value", "color", or the series name); only
+      the value row reads the text column instead of the raw number.
+    Display only: no number is changed.
+    """
+    import altair as alt
+    from streamlit.elements.lib import built_in_chart_utils as _bcu
+
+    if unit == "$":
+        def _text(v):
+            return "" if pd.isna(v) else "${:,.0f}".format(v)
+    elif unit == "%":
+        _text = fmt_pct_half
+    else:
+        raise ValueError(f"unit must be '$' or '%', not {unit!r}")
+
+    if chart_type == "line":
+        chart = _bcu.generate_chart(
+            chart_type=_bcu.ChartType.LINE, data=data, width="stretch", height="content",
+        )
+    elif chart_type == "bar":
+        chart = _bcu.generate_chart(
+            chart_type=_bcu.ChartType.VERTICAL_BAR, data=data, width="stretch", height="content",
+            stack=None, sort_from_user=True,
+        )
+    else:
+        raise ValueError(f"chart_type must be 'line' or 'bar', not {chart_type!r}")
+
+    layers = chart.layer if isinstance(chart, alt.LayerChart) else [chart]
+    tooltip = list(layers[0].encoding.tooltip)
+    value_tip = tooltip[1]  # Streamlit's order: x, y (the value), then series
+    value_field = value_tip._get("shorthand")
+    value_title = value_tip._get("title")
+    text_field = f"{value_field} -- tooltip text"
+    tooltip[1] = alt.Tooltip(
+        field=text_field,
+        title=value_field if value_title is alt.Undefined else value_title,
+        type="nominal",
+    )
+
+    df = chart.data.copy()
+    df[text_field] = df[value_field].map(_text)
+    chart.data = df
+    if isinstance(chart, alt.LayerChart):
+        chart.layer = [layer.encode(tooltip=tooltip) for layer in chart.layer]
+    else:
+        chart = chart.encode(tooltip=tooltip)
+
+    return st.altair_chart(chart, theme="streamlit", width="stretch", height="content")
+
 if cadence == "Annual":
     ann_flags = R.bva_y[(R.bva_y[period_col] == current_period) & (R.bva_y["Flag"] != "On Track")]
     if ann_flags.empty:
@@ -1118,7 +1183,7 @@ with tab_rev:
         pivot = pivot.reindex(period_order)
         if cadence == "Quarterly":
             pivot = pivot.rename(index=R.fmt_period_label)
-        st.line_chart(_chrono_index(pivot))
+        _chart_with_table_tooltip("line", _chrono_index(pivot), "$")
     with col2:
         st.subheader("Revenue by Product Line — full trend")
         chart_df2 = R.revenue.groupby(["Product Line", period_col if cadence == "Quarterly" else "Fiscal Year"], as_index=False)["Revenue ($)"].sum()
@@ -1126,7 +1191,7 @@ with tab_rev:
         pivot2 = pivot2.reindex(period_order)
         if cadence == "Quarterly":
             pivot2 = pivot2.rename(index=R.fmt_period_label)
-        st.line_chart(_chrono_index(pivot2))
+        _chart_with_table_tooltip("line", _chrono_index(pivot2), "$")
 
     st.subheader(f"Revenue Mix (%) — {R.fmt_period_label(current_period)}")
     st.caption(
@@ -1136,9 +1201,9 @@ with tab_rev:
     )
     mixcol1, mixcol2 = st.columns(2)
     with mixcol1:
-        st.bar_chart(rev_region_df[rev_region_df[period_col] == current_period].set_index("Region")["Revenue Mix (%)"])
+        _chart_with_table_tooltip("bar", rev_region_df[rev_region_df[period_col] == current_period].set_index("Region")["Revenue Mix (%)"], "%")
     with mixcol2:
-        st.bar_chart(rev_product_df[rev_product_df[period_col] == current_period].set_index("Product Line")["Revenue Mix (%)"])
+        _chart_with_table_tooltip("bar", rev_product_df[rev_product_df[period_col] == current_period].set_index("Product Line")["Revenue Mix (%)"], "%")
 
     st.subheader(f"Revenue detail — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
     rev_var_cols = ["QoQ/YoY Variance ($)", "QoQ/YoY Variance (%)", "YoY Variance ($)", "YoY Variance (%)"]
@@ -1158,7 +1223,7 @@ with tab_exp:
     pivot3 = exp_chart.pivot(index=period_col, columns="Department", values="Amount ($)").reindex(period_order)
     if cadence == "Quarterly":
         pivot3 = pivot3.rename(index=R.fmt_period_label)
-    st.bar_chart(_chrono_index(pivot3))
+    _chart_with_table_tooltip("bar", _chrono_index(pivot3), "$")
 
     # -------------------------------------------------------------------
     # Cost Structure Investigation View — Builder Brief, 2026-08-09.
@@ -1246,7 +1311,7 @@ with tab_exp:
         "Efficiency page. Unlike company-wide Revenue per Headcount, this ratio IS department-level "
         "in a defensible sense: both the opex and the headcount genuinely belong to the department."
     )
-    st.bar_chart(opex_per_emp_df[opex_per_emp_df[period_col] == current_period].set_index("Department")["Opex per Employee ($)"])
+    _chart_with_table_tooltip("bar", opex_per_emp_df[opex_per_emp_df[period_col] == current_period].set_index("Department")["Opex per Employee ($)"], "$")
     st.dataframe(fmt_display_df(opex_per_emp_df[opex_per_emp_df[period_col] == current_period][
         ["Department", "Amount ($)", "Ending Headcount", "Opex per Employee ($)"]
     ]), use_container_width=True)
@@ -1292,7 +1357,7 @@ with tab_hc:
     trend = company_rev_df.set_index(period_col)["Revenue per Headcount ($, company-wide)"].reindex(period_order)
     if cadence == "Quarterly":
         trend = trend.rename(index=R.fmt_period_label)
-    st.line_chart(_chrono_index(trend))
+    _chart_with_table_tooltip("line", _chrono_index(trend), "$")
 
 with tab_bva:
     st.subheader(f"Budget vs Actual — {R.fmt_period_label(current_period)}")
@@ -3098,7 +3163,7 @@ with tab_region_invest:
     )
 
     st.subheader(f"Revenue, Allocated GTM Cost, and Net of GTM Cost — {R.fmt_period_label(current_period)}")
-    st.bar_chart(region_cm_df[region_cm_df[period_col] == current_period].set_index("Region")["Region Net of GTM Cost ($)"])
+    _chart_with_table_tooltip("bar", region_cm_df[region_cm_df[period_col] == current_period].set_index("Region")["Region Net of GTM Cost ($)"], "$")
     st.dataframe(fmt_display_df(region_cm_df[region_cm_df[period_col] == current_period][
         ["Region", "Region Revenue ($)", "Allocated S&M + CS Opex ($)", "Region Net of GTM Cost ($)"]
     ]), use_container_width=True)
@@ -3119,7 +3184,7 @@ with tab_region_invest:
     )
     if cadence == "Quarterly":
         region_trend = region_trend.rename(index=R.fmt_period_label)
-    st.line_chart(_chrono_index(region_trend))
+    _chart_with_table_tooltip("line", _chrono_index(region_trend), "%")
 
 with tab_product_invest:
     st.title("Product Line Revenue & R&D Investment")
@@ -3129,7 +3194,7 @@ with tab_product_invest:
     )
 
     st.subheader(f"Revenue, Allocated R&D Cost, and Net of R&D Cost — {R.fmt_period_label(current_period)}")
-    st.bar_chart(product_cm_df[product_cm_df[period_col] == current_period].set_index("Product Line")["Product Net of R&D Cost ($)"])
+    _chart_with_table_tooltip("bar", product_cm_df[product_cm_df[period_col] == current_period].set_index("Product Line")["Product Net of R&D Cost ($)"], "$")
     st.dataframe(fmt_display_df(product_cm_df[product_cm_df[period_col] == current_period][
         ["Product Line", "Product Revenue ($)", "Allocated R&D Opex ($)", "Product Net of R&D Cost ($)"]
     ]), use_container_width=True)
@@ -3158,7 +3223,7 @@ with tab_product_invest:
     )
     if cadence == "Quarterly":
         product_trend = product_trend.rename(index=R.fmt_period_label)
-    st.line_chart(_chrono_index(product_trend))
+    _chart_with_table_tooltip("line", _chrono_index(product_trend), "%")
 
 with tab_narr:
     st.subheader(f"AI-Generated Narrative — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
