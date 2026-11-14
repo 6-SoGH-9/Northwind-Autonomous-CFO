@@ -327,7 +327,8 @@ def _narrative_gate_block(scope_quarters):
       2. it is closed but was affected by a later reopen of an earlier
          period and has not itself been reopened and re-closed (its saved
          figures are outdated);
-      3. it has no saved close (not approved);
+      3. it has no saved close (not approved), or its saved close is damaged
+         or incomplete (D22 WP1-4: a separate message);
       4. a close-order control file is damaged (state cannot be verified).
     Reads Close History and the reopen session slot only; sets nothing."""
     in_progress = _find_unresolved_reopen_period()
@@ -348,16 +349,28 @@ def _narrative_gate_block(scope_quarters):
                 f"Reopening {R.fmt_period_label(pending['predecessor_period_label'])} "
                 f"affected {R.fmt_period_label(q)} QoQ."
             )
-    if not scope_quarters or any(
-        close_history.resolve_latest_approved_close_for_period(q) is None for q in scope_quarters
-    ):
-        return (
-            "**This close has not been approved.** Executive narrative generation and the prompt "
-            "download are unavailable until a human approves this close via the Close Approval "
-            "control on the Close Validation Status tab. This applies regardless of Phase 6 "
-            "validation results — an adverse or absent assessment does not block approval, and a "
-            "favorable one does not substitute for it (D13, Human Approval Gate)."
-        )
+    # D22 WP1-4: a period whose saved close is DAMAGED (latest version's
+    # metadata.json unreadable / not an object, or its commentary_record or
+    # observations.csv cannot be read) gets the damaged message, not the "not
+    # approved" one. NOT CLOSED keeps today's message. The classifier is
+    # read-only and lives outside close_history.py (WP1-5). Imported here so the
+    # edit stays inside this function.
+    import narrative_snapshot as NS
+    _not_approved_message = (
+        "**This close has not been approved.** Executive narrative generation and the prompt "
+        "download are unavailable until a human approves this close via the Close Approval "
+        "control on the Close Validation Status tab. This applies regardless of Phase 6 "
+        "validation results — an adverse or absent assessment does not block approval, and a "
+        "favorable one does not substitute for it (D13, Human Approval Gate)."
+    )
+    if not scope_quarters:
+        return _not_approved_message
+    _snapshots = [NS.read_narrative_snapshot(q, _commentary_record_from_dict) for q in scope_quarters]
+    _damaged_periods = [s.period_label for s in _snapshots if s.state == NS.DAMAGED]
+    if _damaged_periods:
+        return NS.damaged_snapshot_message([R.fmt_period_label(q) for q in _damaged_periods])
+    if any(s.state == NS.NOT_CLOSED for s in _snapshots):
+        return _not_approved_message
     return None
 
 
@@ -3226,134 +3239,162 @@ with tab_product_invest:
     _chart_with_table_tooltip("line", _chrono_index(product_trend), "%")
 
 with tab_narr:
+    # D22 WP1: read-only snapshot classifier (new module; imported inside this block).
+    import narrative_snapshot as NS
     st.subheader(f"AI-Generated Narrative — {R.fmt_period_label(current_period)} vs {R.fmt_period_label(prior_period)}")
     st.caption("Uses the exact system + user prompt from northwind_narrative_prompt.md, populated from the tables in the other tabs.")
 
-    # Section G handoff (Brief v5, rewritten this revision): three required
-    # states, not two -- no flags / flags+file-supplied (accepted+unresolved)
-    # / flags+no-file-supplied (unexplained, no cause invented). Determined
-    # here from (a) observation_register (built earlier in the tab_close
-    # block above -- Streamlit executes every tab's body every rerun
-    # regardless of which tab is visually active, so it's always defined by
-    # this point) and (b) commentary_file_supplied, tracked durably across
-    # this session (see Commentary Review section above). Byte-identical to
-    # pre-Phase-4-6 behavior whenever observation_register is empty,
-    # regardless of commentary-file presence (Brief Section G, Criterion 1).
-    #
-    # Phase 7 period-display addendum (addendum to
-    # phase6_headcount_direction_fix_brief_v1.md): this tab's narrative/
-    # prompt text is CFO/Board-facing (IA #9) and must use the same D14
-    # display-format convention as every other user-facing surface. Reuses
-    # the existing R.fmt_period_label formatter -- no second implementation.
-    # Fix (commentary lost before/without download): for a CLOSED quarter the
-    # register and the Commentary Record are read back from that period's own
-    # latest approved Close History snapshot, not from session memory -- so the
-    # narrative prompt is identical whether it is viewed right after approval,
-    # after a page refresh, or days later in a new session. Unclosed periods,
-    # and Annual cadence, keep the existing session-based path unchanged.
-    _narr_register = observation_register
-    _narr_records = st.session_state.get("commentary_records", {})
-    _narr_file_supplied = st.session_state.get("commentary_file_supplied", False)
-    if cadence == "Quarterly":
-        try:
-            _archived_commentary = _archived_commentary_for_period(current_period)
-        except Exception as _archive_read_exc:
-            _archived_commentary = None
-            st.warning(
-                f"The archived commentary for {R.fmt_period_label(current_period)} could not be read "
-                f"({type(_archive_read_exc).__name__}: {_archive_read_exc}). The prompt below is built from "
-                f"this session only and may be missing commentary."
-            )
-        if _archived_commentary is not None:
-            _narr_register, _narr_records, _narr_file_supplied = _archived_commentary
-    # Fix (cross-period leak): when the register comes from this session, it is
-    # the one built for the Close Validation tab's own period selector, which can
-    # differ from the sidebar period this prompt is about. Keep only observations
-    # belonging to the period(s) the prompt covers, so a flag from another
-    # period is never attributed to this narrative.
-    if _narr_register is observation_register and not observation_register.empty:
-        _narr_scope_labels = {
-            R.fmt_period_label(_q)
-            for _q in (
-                [current_period] if cadence == "Quarterly"
-                else [q for q in R.quarter_order if q.endswith(" " + str(current_period))]
-            )
-        }
-        _narr_register = observation_register[observation_register["Period"].isin(_narr_scope_labels)]
-    _commentary_block = CWF.build_narrative_commentary_section(
-        _narr_register,
-        _narr_records,
-        _narr_file_supplied,
-        fmt_period_label=R.fmt_period_label,
-    )
-    user_prompt = R.build_user_prompt(
-        period_col, period_order, current_period, prior_period, prior_period,
-        pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
-        exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
-        commentary_narrative_block=_commentary_block,
-        movement_component_sources=movement_component_sources,
-    )
-
-    with st.expander("View rendered prompt (data sent to the model)"):
-        st.text(user_prompt)
-
-    # ---------------------------------------------------------------------
-    # Human Approval Gate (Brief human_approval_gate_brief_v1.md), Section
-    # A/E, Criteria 1-3. STRUCTURAL gate, not cosmetic: when the close is
-    # not approved, the code paths that call R.call_claude_narrative() and
-    # that build the download button simply do not execute at all -- they
-    # sit inside the `if _gate_approved:` branch below.
-    #
-    # Principal-directed fix (live-testing session): this gate previously
-    # read the Close Validation Status tab's own `target_period` selector
-    # and the in-session approval flag, so it ignored the sidebar period
-    # this tab's narrative is actually about. It now keys on the sidebar
-    # `current_period` and on Close History (a saved close), with no new
-    # selector on this tab:
-    #   Quarterly: current_period has a saved close in Close History
-    #     (also true for a period closed in an earlier session).
-    #   Annual: every quarter of the selected fiscal year has a saved close.
-    # It is additionally blocked while a reopen of that period is in
-    # progress, and while that period is flagged as affected by a reopen of
-    # an earlier period (see _narrative_gate_block).
-    # A saved close only ever exists after the explicit Approve action
-    # passed the close-order checks, so per D13 no Phase 6 outcome sets or
-    # implies it.
-    # ---------------------------------------------------------------------
-    _narrative_scope = (
+    # D22 WP1-1 / WP1-2 / WP1-3: a CLOSED period's commentary is read from its
+    # approved Close History snapshot and from nowhere else. If the latest saved
+    # close is DAMAGED (or incomplete) for narrative generation, nothing below is
+    # built: no prompt from session-state commentary, no fall-back to an older
+    # version, and the message says 'damaged or incomplete' (it does not tell the
+    # user to reopen). Under Annual all four quarters of the fiscal year are read
+    # this way and any damaged quarter blocks the tab. A period that is NOT CLOSED
+    # keeps its existing read-only session preview (D22-B (13)); the gate below
+    # still blocks output for it.
+    _narr_scope_periods = (
         [q for q in R.quarter_order if q.endswith(" " + str(current_period))]
         if cadence == "Annual" else [current_period]
     )
-    _narrative_block = _narrative_gate_block(_narrative_scope)
-    _gate_approved = _narrative_block is None
-
-    if not _gate_approved:
-        st.warning(_narrative_block)
+    _narr_snaps = [NS.read_narrative_snapshot(q, _commentary_record_from_dict) for q in _narr_scope_periods]
+    _narr_damaged = [s.period_label for s in _narr_snaps if s.state == NS.DAMAGED]
+    if _narr_damaged:
+        # The gate keeps its priority order (reopen in progress, outdated, control
+        # file) and returns the damaged message for a damaged period.
+        st.warning(
+            _narrative_gate_block(_narr_scope_periods)
+            or NS.damaged_snapshot_message([R.fmt_period_label(q) for q in _narr_damaged])
+        )
     else:
-        api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
-
-        if api_key_present:
-            if st.button("Generate narrative", type="primary"):
-                with st.spinner("Calling Claude..."):
-                    narrative, error = R.call_claude_narrative(user_prompt)
-                if narrative:
-                    st.markdown(narrative.replace("\n\n", "\n\n> ").replace("\n", "\n\n"))
-                else:
-                    st.error(error)
+        # Section G handoff (Brief v5, rewritten this revision): three required
+        # states, not two -- no flags / flags+file-supplied (accepted+unresolved)
+        # / flags+no-file-supplied (unexplained, no cause invented). Determined
+        # here from (a) observation_register (built earlier in the tab_close
+        # block above -- Streamlit executes every tab's body every rerun
+        # regardless of which tab is visually active, so it's always defined by
+        # this point) and (b) commentary_file_supplied, tracked durably across
+        # this session (see Commentary Review section above). Byte-identical to
+        # pre-Phase-4-6 behavior whenever observation_register is empty,
+        # regardless of commentary-file presence (Brief Section G, Criterion 1).
+        #
+        # Phase 7 period-display addendum (addendum to
+        # phase6_headcount_direction_fix_brief_v1.md): this tab's narrative/
+        # prompt text is CFO/Board-facing (IA #9) and must use the same D14
+        # display-format convention as every other user-facing surface. Reuses
+        # the existing R.fmt_period_label formatter -- no second implementation.
+        # Fix (commentary lost before/without download): for a CLOSED quarter the
+        # register and the Commentary Record are read back from that period's own
+        # latest approved Close History snapshot, not from session memory -- so the
+        # narrative prompt is identical whether it is viewed right after approval,
+        # after a page refresh, or days later in a new session. Unclosed periods,
+        # and Annual cadence, keep the existing session-based path unchanged.
+        _narr_register = observation_register
+        _narr_records = st.session_state.get("commentary_records", {})
+        _narr_file_supplied = st.session_state.get("commentary_file_supplied", False)
+        # D22 WP1-1/WP1-2: when every period in scope is READABLE the commentary comes
+        # from the approved snapshot(s); the three session-state values above are then
+        # not used at all. They remain only for a period that is NOT CLOSED (preview).
+        _narr_inputs = None
+        if _narr_snaps and all(_s.state == NS.READABLE for _s in _narr_snaps):
+            _narr_inputs = NS.commentary_inputs_for_quarters(_narr_snaps)
+        # Fix (cross-period leak): when the register comes from this session, it is
+        # the one built for the Close Validation tab's own period selector, which can
+        # differ from the sidebar period this prompt is about. Keep only observations
+        # belonging to the period(s) the prompt covers, so a flag from another
+        # period is never attributed to this narrative.
+        if _narr_inputs is None and _narr_register is observation_register and not observation_register.empty:
+            _narr_scope_labels = {
+                R.fmt_period_label(_q)
+                for _q in (
+                    [current_period] if cadence == "Quarterly"
+                    else [q for q in R.quarter_order if q.endswith(" " + str(current_period))]
+                )
+            }
+            _narr_register = observation_register[observation_register["Period"].isin(_narr_scope_labels)]
+        if _narr_inputs is not None:
+            _commentary_block = "".join(
+                CWF.build_narrative_commentary_section(
+                    _ci.register, _ci.records, _ci.commentary_file_supplied,
+                    fmt_period_label=R.fmt_period_label,
+                )
+                for _ci in _narr_inputs
+            )
         else:
-            st.info(
-                "No ANTHROPIC_API_KEY found in this environment. Download the rendered prompt "
-                "below and paste it into a Claude chat to generate the narrative manually — same "
-                "system prompt, same rules, same numbers, just a manual hand-off instead of a "
-                "live API call."
+            _commentary_block = CWF.build_narrative_commentary_section(
+                _narr_register,
+                _narr_records,
+                _narr_file_supplied,
+                fmt_period_label=R.fmt_period_label,
             )
-            safe_current = R.fmt_period_label(current_period).replace(" ", "_")
-            safe_prior = R.fmt_period_label(prior_period).replace(" ", "_")
-            filename = f"prompt_{safe_current}_vs_{safe_prior}.txt"
-            st.download_button(
-                label="Download prompt for this period",
-                data=user_prompt,
-                file_name=filename,
-                mime="text/plain",
-                type="primary",
-            )
+        user_prompt = R.build_user_prompt(
+            period_col, period_order, current_period, prior_period, prior_period,
+            pl_df, rev_region_df, rev_product_df, region_cm_df, product_cm_df,
+            exp_dept_df, sb_df, breadth_df, hc_dept_df, company_rev_df, bva_df,
+            commentary_narrative_block=_commentary_block,
+            movement_component_sources=movement_component_sources,
+        )
+
+        with st.expander("View rendered prompt (data sent to the model)"):
+            st.text(user_prompt)
+
+        # ---------------------------------------------------------------------
+        # Human Approval Gate (Brief human_approval_gate_brief_v1.md), Section
+        # A/E, Criteria 1-3. STRUCTURAL gate, not cosmetic: when the close is
+        # not approved, the code paths that call R.call_claude_narrative() and
+        # that build the download button simply do not execute at all -- they
+        # sit inside the `if _gate_approved:` branch below.
+        #
+        # Principal-directed fix (live-testing session): this gate previously
+        # read the Close Validation Status tab's own `target_period` selector
+        # and the in-session approval flag, so it ignored the sidebar period
+        # this tab's narrative is actually about. It now keys on the sidebar
+        # `current_period` and on Close History (a saved close), with no new
+        # selector on this tab:
+        #   Quarterly: current_period has a saved close in Close History
+        #     (also true for a period closed in an earlier session).
+        #   Annual: every quarter of the selected fiscal year has a saved close.
+        # It is additionally blocked while a reopen of that period is in
+        # progress, and while that period is flagged as affected by a reopen of
+        # an earlier period (see _narrative_gate_block).
+        # A saved close only ever exists after the explicit Approve action
+        # passed the close-order checks, so per D13 no Phase 6 outcome sets or
+        # implies it.
+        # ---------------------------------------------------------------------
+        _narrative_scope = (
+            [q for q in R.quarter_order if q.endswith(" " + str(current_period))]
+            if cadence == "Annual" else [current_period]
+        )
+        _narrative_block = _narrative_gate_block(_narrative_scope)
+        _gate_approved = _narrative_block is None
+
+        if not _gate_approved:
+            st.warning(_narrative_block)
+        else:
+            api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+            if api_key_present:
+                if st.button("Generate narrative", type="primary"):
+                    with st.spinner("Calling Claude..."):
+                        narrative, error = R.call_claude_narrative(user_prompt)
+                    if narrative:
+                        st.markdown(narrative.replace("\n\n", "\n\n> ").replace("\n", "\n\n"))
+                    else:
+                        st.error(error)
+            else:
+                st.info(
+                    "No ANTHROPIC_API_KEY found in this environment. Download the rendered prompt "
+                    "below and paste it into a Claude chat to generate the narrative manually — same "
+                    "system prompt, same rules, same numbers, just a manual hand-off instead of a "
+                    "live API call."
+                )
+                safe_current = R.fmt_period_label(current_period).replace(" ", "_")
+                safe_prior = R.fmt_period_label(prior_period).replace(" ", "_")
+                filename = f"prompt_{safe_current}_vs_{safe_prior}.txt"
+                st.download_button(
+                    label="Download prompt for this period",
+                    data=user_prompt,
+                    file_name=filename,
+                    mime="text/plain",
+                    type="primary",
+                )
