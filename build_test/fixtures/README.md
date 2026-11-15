@@ -24,3 +24,14 @@ prints its pipeline): `import rollups as R; R.build_user_prompt("Fiscal Quarter"
 "Q4 FY2026", "Q3 FY2026", "Q3 FY2026", R.pl_q, R.rev_by_region_q, R.rev_by_product_q, R.region_cm_q,
 R.product_cm_q, R.exp_by_dept_q, R.sb_volrate_q, R.breadth_all_q, R.hc_dept_q,
 R.company_rev_per_hc_q, R.bva_q, movement_component_sources=R.MOVEMENT_COMPONENT_SOURCES_Q)`.
+
+## `narrative_number_check_release1.py`
+
+| Item | Value |
+|---|---|
+| What it is | A byte-exact copy of the Release 1 module `narrative_number_check.py` as it is on `main` at `9af2f18` |
+| SHA-256 | `6960899c48aa0f15bdb6cb6fbe9d1383fb53072fed7a8d77f149023b2ce1016c` (checked by `build_test/test_addendum1_number_check.py`) |
+| Added for | D22 Addendum 1, A-6(c): "a block without the heading has no Budget lines and behaves as Release 1" |
+| Used for | The Addendum 1 tests load it under the name `narrative_number_check_release1` and compare its results field by field with the amended module |
+| Never imported by | The product. Not a test file (`unittest discover` does not import it: the `fixtures` folder is not a package) |
+| Suitable for | Builder regression tests only |
