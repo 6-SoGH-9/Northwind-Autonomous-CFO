@@ -1,0 +1,132 @@
+Period: Q4 2026
+Comparison basis: vs. Q3 2026
+
+DATA:
+
+Consolidated P&L:
+- Revenue: $4,016,906 vs $3,775,631 (+6.4%)
+- Total Opex: $2,482,356 vs $2,454,984 (+1.1%)
+- Operating Profit: $1,534,550 vs $1,320,647
+- Operating Margin: 38.2% vs 35.0%
+
+Revenue by Region (Q4 2026):
+  - APAC: $669,939 vs $633,549 (+5.7%)
+  - EMEA: $1,203,534 vs $1,094,086 (+10.0%)
+  - LATAM: $322,521 vs $289,104 (+11.6%)
+  - North America: $1,820,912 vs $1,758,892 (+3.5%)
+
+Revenue by Product Line (Q4 2026):
+  - Add-on: Forecasting: $808,898 vs $725,323 (+11.5%)
+  - Add-on: Reporting: $614,830 vs $560,103 (+9.8%)
+  - Core Platform: $2,184,198 vs $2,104,687 (+3.8%)
+  - Professional Services: $408,979 vs $385,519 (+6.1%)
+
+Regional Go-to-Market Investment / Product Line R&D Investment (Q4 2026) — $ only, no cross-segment % (see note below):
+Region cut (net of Sales & Marketing + Customer Success only):
+  - APAC: Revenue $669,939, Allocated S&M+CS Opex $189,173, Net of GTM Cost $480,767
+  - EMEA: Revenue $1,203,534, Allocated S&M+CS Opex $339,845, Net of GTM Cost $863,689
+  - LATAM: Revenue $322,521, Allocated S&M+CS Opex $91,071, Net of GTM Cost $231,450
+  - North America: Revenue $1,820,912, Allocated S&M+CS Opex $514,176, Net of GTM Cost $1,306,736
+Product Line cut (net of R&D only):
+  - Add-on: Forecasting: Revenue $808,898, Allocated R&D Opex $202,275, Net of R&D Cost $606,623
+  - Add-on: Reporting: Revenue $614,830, Allocated R&D Opex $153,746, Net of R&D Cost $461,084
+  - Core Platform: Revenue $2,184,198, Allocated R&D Opex $546,187, Net of R&D Cost $1,638,011
+  - Professional Services: Revenue $408,979, Allocated R&D Opex $0, Net of R&D Cost $408,979
+  NOTE: these are investment-proportionality figures ($only) — Net of GTM Cost (region) and Net of R&D Cost (product) — not a margin or profitability measure, and not comparable to each other (different cost bases). No cross-segment % is provided anywhere in this data by design (Professional Services carries zero allocated R&D, so its Net of R&D Cost equals its own revenue). Use the $ figures only to discuss relative segment size or which segment carries the largest/smallest allocated cost — never infer or state a %.
+
+Expenses by Department:
+  - Customer Success: $379,949 vs $370,958 (+2.4%)
+  - G&A: $445,883 vs $434,372 (+2.7%)
+  - R&D: $902,208 vs $902,047 (+0.0%)
+  - Sales & Marketing: $754,316 vs $747,607 (+0.9%)
+
+Salaries & Benefits — Volume/Rate Decomposition (pre-calculated, per department):
+  - Customer Success: headcount change +1.3, cost-per-head change $-139, Volume effect $12,431, Rate effect $-4,040, total variance $8,390
+  - G&A: headcount change -1.3, cost-per-head change $1,096, Volume effect $-15,921, Rate effect $26,671, total variance $10,751
+  - R&D: headcount change +1.0, cost-per-head change $-207, Volume effect $10,016, Rate effect $-13,379, total variance $-3,362
+  - Sales & Marketing: headcount change +1.0, cost-per-head change $-156, Volume effect $11,093, Rate effect $-7,488, total variance $3,604
+(Volume effect = change in headcount x prior period cost-per-head. Rate effect = new headcount x change in cost-per-head. Calculated upstream — narrate, do not recompute.)
+
+Revenue and Expenses — Breadth/Concentration, with per-segment Component Breakdown (pre-calculated, D17-BB-001):
+Revenue (by Region) — Q4 2026
+Total Variance: $241,275
+
+Component Breakdown:
+  APAC: $36,390  | +15%
+  EMEA: $109,448  | +45%
+  LATAM: $33,417  | +14%
+  North America: $62,020  | +26%
+
+Assessment: Broad-based across 4 of 4 segments driving the net movement
+Revenue (by Product Line) — Q4 2026
+Total Variance: $241,275
+
+Component Breakdown:
+  Add-on: Forecasting: $83,576  | +35%
+  Add-on: Reporting: $54,728  | +23%
+  Core Platform: $79,511  | +33%
+  Professional Services: $23,461  | +10%
+
+Assessment: Broad-based across 4 of 4 segments driving the net movement
+Expenses — Q4 2026
+Total Variance: $27,372
+
+Component Breakdown:
+  Other Opex: $11,835  | +43%
+  Salaries & Benefits: $19,383  | +71%
+  Software & Tools: $-3,846  | -14%
+
+Assessment: Concentrated in Salaries & Benefits (+71% of net variance, threshold 17%), driving the net movement
+Salaries & Benefits (by Department) — Q4 2026
+Total Variance: $19,383
+
+Component Breakdown:
+  Customer Success: $8,390  | +31%
+  G&A: $10,751  | +39%
+  R&D: $-3,362  | -12%
+  Sales & Marketing: $3,604  | +13%
+
+Assessment: Concentrated in G&A (+39% of net variance, threshold 17%), driving the net movement
+Software & Tools (by Department) — Q4 2026
+Total Variance: $-3,846
+
+Component Breakdown:
+  Customer Success: $-1,319  | -5%
+  G&A: $166  | +1%
+  R&D: $-3,613  | -13%
+  Sales & Marketing: $920  | +3%
+
+Assessment: Broad-based across 2 of 4 segments driving the net movement
+Other Opex (by Department) — Q4 2026
+Total Variance: $11,835
+
+Component Breakdown:
+  Customer Success: $1,919  | +7%
+  G&A: $595  | +2%
+  R&D: $7,136  | +26%
+  Sales & Marketing: $2,184  | +8%
+
+Assessment: Concentrated in R&D (+26% of net variance, threshold 17%), driving the net movement
+(Not a volume/rate split — measures whether a variance is systemic/broad-based or concentrated in one segment, on a NET (signed), not gross, basis; no gross-variance figure appears anywhere below. Revenue lines (by Region, by Product Line) use their own total and a 60% concentration threshold. Expenses lines (Total Expenses, then each Category, then each Category's Departments) all share ONE denominator — Total Expenses' own net variance — for both their % share and their driving-vs-offsetting classification, at a 17% concentration threshold; a Department's or Category's own "Total Variance" line is still its own subtotal, only its % and classification reference the shared total. An opposing segment carrying >=20% of net variance is flagged as substantially offsetting, for both Revenue and Expenses. Do not add "favorable"/"unfavorable" wording anywhere in this section.)
+
+Headcount:
+  - Customer Success: 29 vs 28.0
+  - G&A: 24 vs 25.0
+  - R&D: 66 vs 64.0
+  - Sales & Marketing: 48 vs 48.0
+  Company-wide Revenue per Headcount: $24,053 vs $22,883
+
+Budget vs Actual — flagged items only (Watch or Major Miss):
+  - Revenue: Budget $4,294,336, Actual $4,016,906, Variance -6.5% — Watch
+(Flag thresholds: |Variance %| > 8% = Major Miss, > 4% = Watch, else On Track.)
+
+
+TASK:
+Write commentary under these section headers, in this order:
+
+1. Headline (1-2 sentences: the single most important story this period, tying revenue, margin, and the biggest flagged variance together)
+2. Revenue Drivers (which region/product line drove the change, using the breadth/concentration figures — broad-based vs. localized, not volume vs rate)
+3. Margin and Cost Structure (what happened to operating margin and why, referencing department-level spend and the Salaries & Benefits volume/rate decomposition where applicable)
+4. Investment Alignment (brief, $ only: which region/product line carries the largest and smallest allocated cost this period, and any notable shift in Net-of-cost $ vs. prior period for a segment. No % language anywhere in this section — do not state, imply, or compute a percentage for any segment.)
+5. Budget Variance Flags (walk through each Major Miss by name, plus any Watch item that's now recurring for 2+ consecutive periods if that data is available)
+6. Headcount and Efficiency (revenue-per-headcount trend, whether headcount growth is tracking ahead of or behind revenue growth)
