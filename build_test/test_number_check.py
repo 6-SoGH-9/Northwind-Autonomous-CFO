@@ -306,12 +306,22 @@ class TestWP3_3_LineLevel(unittest.TestCase):
         self.assertEqual(statuses("R&D was $902,208."), [("$902,208", "matched")])
 
     def test_a_correct_figure_with_two_named_lines_carrying_it_is_flagged_not_guessed(self):
-        """Recorded expected result, not a defect: 'Revenue' labels the consolidated line and the Budget vs Actual
-        line and both print $4,016,906, so the name does not single out one line (D22-G (B3), pass-rule clause (e))."""
+        """CHANGED BY ADDENDUM 1 A-3 (Principal ruling 2, 2026-11-15). In Release 1 this sentence was flagged as
+        ambiguous: 'Revenue' labels the consolidated line and the Budget vs Actual line and both print $4,016,906
+        (D22-G (B3), pass-rule clause (e)). Under A-3 a sentence with no budget word is matched against actual lines
+        only, so the Budget line is neither a candidate nor a name, and the number matches the consolidated line.
+        Both lines are still listed as equal-figure lines for a pick (A-5b). The Release 1 outcome is kept below for a
+        block whose Budget section is treated as an actual section, to show what changed."""
         r = check("Revenue was $4,016,906.")
-        self.assertEqual(r.numbers[0].status, "flagged")
-        self.assertEqual(r.flags[0].reason, N.REASON_AMBIGUOUS)
-        self.assertEqual(len(r.flags[0].candidate_lines), 2)
+        self.assertEqual(r.numbers[0].status, "matched")
+        self.assertEqual(r.numbers[0].line_id, line_id("Revenue", 0, "Consolidated"))
+        # Release 1 outcome, reproduced on the same block with the Budget heading renamed (no Budget lines):
+        no_budget = N.parse_data_block(DATA.replace(N.BUDGET_SECTION_HEADING, "Budget vs Actual (heading renamed)"))
+        self.assertEqual(no_budget.budget_lines, ())
+        r1 = N.check_numbers("Revenue was $4,016,906.", no_budget)
+        self.assertEqual(r1.numbers[0].status, "flagged")
+        self.assertEqual(r1.flags[0].reason, N.REASON_AMBIGUOUS)
+        self.assertEqual(len(r1.flags[0].candidate_lines), 2)
 
 
 class TestWP3_4_EveryNonExactNumberIsAFlag(unittest.TestCase):
