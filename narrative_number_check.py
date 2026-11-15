@@ -21,7 +21,7 @@ D22-G (B1)(B3), D22-H (3)):
     figure written where the prior figure of the same line belongs passes; a
     wrong number that is the right figure for the line named passes; a number
     written after the name of a different line passes when it equals that
-    line's figure. tests/test_number_check.py records each as an expected result.
+    line's figure. build_test/test_number_check.py records each as an expected result.
   * Picking a line (Option 4) re-runs the check against that line (WP3-7).
   * An acceptance is keyed to (number as written, line), never to the display
     label "Flag n" (WP3-8).
@@ -51,11 +51,30 @@ scope and each is a small, isolated function:
       digits), dates and times, ordinals, list numbering, digits glued to letters
       (e.g. "D17", "2c"), leading-zero strings ("001"). Spelled-out numbers are
       not scanned.
+
+ADDENDUM 1 (governance/builder_briefs/D22_Narrative_versioning_builder_brief_addendum_1.md,
+revision 5, signed 2026-11-13; Principal rulings of 2026-11-15 noted with "ruling"):
+  Part A  Budget lines. Lines under the heading BUDGET_SECTION_HEADING, up to (not
+          including) the line that begins BUDGET_SECTION_END, are Budget lines; all
+          others are actual lines (A-1). A number whose sentence (or, under A-2b, the
+          previous sentence) holds a budget word (A-2) is matched against Budget lines
+          only, for the figure and for the name; otherwise against actual lines only
+          (A-3). Ruling 1: this holds even when the block has no Budget lines, so such
+          a number is then flagged and can be cleared by a pick. Picks, candidate_lines
+          and lines_of_kind use all lines (A-5b).
+  Part B  Direction. An unsigned number that matched exactly one line (by name or
+          by pick) and has an attached direction word (B-2, B-3, B-4) is flagged with
+          REASON_DIRECTION when every equal printed figure on that line has the
+          opposite sign (B-5), or with REASON_DIRECTION_WORDS_DISAGREE when a word
+          before and a word after it disagree (B-6). These flags have flag_class
+          "direction" and their own acceptance key (B-7, B-7a). Ruling 3: a B-6 flag
+          carries no direction_word and no direction (both None). R3 still applies to
+          numbers with an explicit sign and to numbers with no direction word.
 """
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -69,7 +88,7 @@ EXPLICIT_SIGN_MUST_AGREE = True
 
 # Markers that end the locked DATA block inside a rendered prompt: the three
 # commentary blocks printed by commentary_workflow.build_narrative_commentary_section()
-# and the TASK section. tests/test_number_check.py asserts these strings still
+# and the TASK section. build_test/test_number_check.py asserts these strings still
 # appear in what that function produces.
 _DATA_END_MARKERS = (
     "\nFinance/CFO-Approved Explanations (accepted commentary",
@@ -79,6 +98,43 @@ _DATA_END_MARKERS = (
 )
 
 _SIGN_CHARS = "+-−–"
+
+# ---------------------------------------------------------------------------
+# Addendum 1 constants (each list is copied from the signed addendum)
+# ---------------------------------------------------------------------------
+# A-1 / A-6: the Budget vs Actual section of the DATA block, as rollups.py prints it.
+BUDGET_SECTION_HEADING = "Budget vs Actual — flagged items only"
+BUDGET_SECTION_END = "(Flag thresholds"
+# A-2: whole words, case-insensitive ...
+BUDGET_WORDS = frozenset({"budget", "budgets", "budgeted", "plan"})
+# ... and the status words, case-sensitive, exactly as printed (E-9, Gate decision 8).
+BUDGET_STATUS_WORDS = (("Major", "Miss"), ("Watch",))
+
+# B-7: flag classes.
+FLAG_CLASS_NUMBER = "number"
+FLAG_CLASS_DIRECTION = "direction"
+UP = "up"
+DOWN = "down"
+# B-2: words before the number ...
+DIRECTION_WORDS_BEFORE = {
+    **{w: UP for w in ("up", "rose", "risen", "grew", "grown", "increased", "climbed", "gained", "jumped",
+                       "surged", "expanded")},
+    **{w: DOWN for w in ("down", "fell", "fallen", "dropped", "declined", "decreased", "slipped", "dipped",
+                         "shrank", "shrunk", "contracted", "reduced")},
+}
+# ... words after the number ...
+DIRECTION_WORDS_AFTER = {"higher": UP, "lower": DOWN, "up": UP, "down": DOWN}
+# ... and words after the number only when a budget word follows directly (E-8, Gate decision 5),
+# optionally after one of BUDGET_WORD_LEAD_INS.
+DIRECTION_WORDS_AFTER_WITH_BUDGET = {"below": DOWN, "under": DOWN, "above": UP, "over": UP}
+BUDGET_WORD_LEAD_INS = frozenset({"the", "its", "our"})
+# B-3: fillers allowed between a word before the number and the number (E-3) ...
+DIRECTION_FILLERS = frozenset({"by", "about", "around", "roughly", "approximately", "nearly", "almost", "just", "some"})
+# ... and the words that make a direction word describe a level instead.
+LEVEL_WORDS = frozenset({"to", "from"})
+# B-4: negations within three words before the direction word (E-4); "n't" forms are matched by suffix.
+NEGATION_WORDS = frozenset({"not", "no", "never", "without"})
+NEGATION_WINDOW = 3
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +300,7 @@ class DataLine:
     text: str
     aliases: Tuple[Tuple[str, ...], ...]
     figures: Tuple[PrintedFigure, ...]
+    is_budget: bool = False   # Addendum 1 A-1: a line of the Budget vs Actual section
 
     def figures_of_kind(self, kind):
         return tuple(f for f in self.figures if f.kind == kind)
@@ -265,6 +322,13 @@ class DataBlock:
     by_id: Mapping[str, DataLine]
     alias_lines: Mapping[Tuple[str, ...], Tuple[str, ...]]   # alias tokens -> line ids (DATA order)
     max_alias_len: int
+    # Addendum 1 A-3: the same index split by pool (Budget lines / actual lines).
+    budget_alias_lines: Mapping[Tuple[str, ...], Tuple[str, ...]] = field(default_factory=dict)
+    actual_alias_lines: Mapping[Tuple[str, ...], Tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def budget_lines(self):
+        return tuple(ln for ln in self.lines if ln.is_budget)
 
     def line_ref(self, line_id, kind):
         ln = self.by_id[line_id]
@@ -317,10 +381,16 @@ def parse_data_block(data_block: str) -> DataBlock:
     lines: List[DataLine] = []
     section = ""
     seen: Dict[str, int] = {}
+    in_budget = False                                  # Addendum 1 A-1
     for i, raw_line in enumerate(data_block.split("\n")):
         stripped = raw_line.strip()
         if not stripped:
             continue
+        line_is_budget = in_budget
+        if stripped.startswith(BUDGET_SECTION_HEADING):
+            in_budget, line_is_budget = True, False    # lines UNDER the heading are Budget lines
+        elif stripped.startswith(BUDGET_SECTION_END):
+            in_budget = line_is_budget = False         # the thresholds line itself is not a Budget line (A-6(b))
         toks = _scan(raw_line, "printed")
         if not toks:
             indent = len(raw_line) - len(raw_line.lstrip(" "))
@@ -343,17 +413,22 @@ def parse_data_block(data_block: str) -> DataBlock:
         line_id = base if n == 0 else f"{base}-{n}"
         lines.append(DataLine(
             line_id=line_id, index=i, section=section, label=label, text=stripped,
-            aliases=tuple(aliases), figures=tuple(_printed_figure(t) for t in toks),
+            aliases=tuple(aliases), figures=tuple(_printed_figure(t) for t in toks), is_budget=line_is_budget,
         ))
     alias_lines: Dict[Tuple[str, ...], List[str]] = {}
+    budget_alias: Dict[Tuple[str, ...], List[str]] = {}
+    actual_alias: Dict[Tuple[str, ...], List[str]] = {}
     for ln in lines:
         for a in ln.aliases:
             alias_lines.setdefault(a, []).append(ln.line_id)
+            (budget_alias if ln.is_budget else actual_alias).setdefault(a, []).append(ln.line_id)
     return DataBlock(
         lines=tuple(lines),
         by_id={ln.line_id: ln for ln in lines},
         alias_lines={a: tuple(ids) for a, ids in alias_lines.items()},
         max_alias_len=max((len(a) for a in alias_lines), default=0),
+        budget_alias_lines={a: tuple(ids) for a, ids in budget_alias.items()},
+        actual_alias_lines={a: tuple(ids) for a, ids in actual_alias.items()},
     )
 
 
@@ -430,16 +505,18 @@ def _sentence_spans(text):
     return spans
 
 
-def _name_occurrences(sentence_text, offset, block: DataBlock):
+def _name_occurrences(sentence_text, offset, block: DataBlock, alias_lines=None):
     """All name occurrences in a sentence as (char_start, char_end, tuple(line ids)),
-    overlaps resolved to the longer occurrence (R2)."""
+    overlaps resolved to the longer occurrence (R2). alias_lines selects a pool
+    (Addendum 1 A-3); None means every line, as in Release 1."""
+    alias_lines = block.alias_lines if alias_lines is None else alias_lines
     toks = [(m.group(), m.start(), m.end()) for m in _TOKEN_RE.finditer(sentence_text)]
     norm = [("and" if t == "&" else t.lower()) for t, _, _ in toks]
     found = []
     for n in range(min(block.max_alias_len, len(norm)), 0, -1):
         for i in range(0, len(norm) - n + 1):
             alias = tuple(norm[i:i + n])
-            ids = block.alias_lines.get(alias)
+            ids = alias_lines.get(alias)
             if ids:
                 found.append((n, i, i + n - 1, toks[i][1] + offset, toks[i + n - 1][2] + offset, ids))
     found.sort(key=lambda f: (-f[0], f[1]))
@@ -454,22 +531,174 @@ def _name_occurrences(sentence_text, offset, block: DataBlock):
     return taken
 
 
-def _nearest_preceding_name(number: WrittenNumber, text, sentences, block: DataBlock):
+def _nearest_preceding_name(number: WrittenNumber, text, sentences, block: DataBlock, alias_lines=None):
     """(char_start, char_end, line ids) of the nearest line name before the
     number, in the same sentence, else in the previous sentence; None if neither
-    holds one."""
+    holds one. alias_lines selects a pool (Addendum 1 A-3); None = every line."""
     si = next((k for k, (s, e) in enumerate(sentences) if s <= number.start < e), None)
     if si is None:
         return None
     s, e = sentences[si]
-    in_sentence = [o for o in _name_occurrences(text[s:number.start], s, block)]
+    in_sentence = [o for o in _name_occurrences(text[s:number.start], s, block, alias_lines)]
     if in_sentence:
         return max(in_sentence, key=lambda o: o[1])
     if si > 0:
         ps, pe = sentences[si - 1]
-        prev = _name_occurrences(text[ps:pe], ps, block)
+        prev = _name_occurrences(text[ps:pe], ps, block, alias_lines)
         if prev:
             return max(prev, key=lambda o: o[1])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Addendum 1 Part A: budget words and the pool a number is matched in
+# ---------------------------------------------------------------------------
+def _has_budget_word(text) -> bool:
+    """A-2: a budget word, found with the same tokenizer as the name matching.
+    BUDGET_WORDS case-insensitive; BUDGET_STATUS_WORDS case-sensitive, as printed."""
+    raw = [t for t in _TOKEN_RE.findall(text) if t != "&"]
+    for i, t in enumerate(raw):
+        if t.lower() in BUDGET_WORDS:
+            return True
+        for phrase in BUDGET_STATUS_WORDS:
+            if tuple(raw[i:i + len(phrase)]) == phrase:
+                return True
+    return False
+
+
+def _sentence_index(number: WrittenNumber, sentences):
+    return next((k for k, (s, e) in enumerate(sentences) if s <= number.start < e), None)
+
+
+def _uses_budget_pool(number: WrittenNumber, text, sentences, block: DataBlock) -> bool:
+    """A-2b, A-3: True when the number's own whole sentence holds a budget word,
+    or when that sentence holds no line name (of any pool) before the number and
+    the previous sentence holds a budget word."""
+    si = _sentence_index(number, sentences)
+    if si is None:
+        return False
+    s, e = sentences[si]
+    if _has_budget_word(text[s:e]):
+        return True
+    if si > 0 and not _name_occurrences(text[s:number.start], s, block):
+        ps, pe = sentences[si - 1]
+        return _has_budget_word(text[ps:pe])
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Addendum 1 Part B: direction words
+# ---------------------------------------------------------------------------
+_WORD_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*")
+
+
+def _words(text, offset=0):
+    return [(m.group(), m.start() + offset, m.end() + offset) for m in _WORD_RE.finditer(text)]
+
+
+def _is_negated(text, sentence_start, word_start) -> bool:
+    """B-4: a negation within NEGATION_WINDOW words before the direction word, in
+    the same sentence."""
+    before = _words(text[sentence_start:word_start])[-NEGATION_WINDOW:]
+    for w, _, _ in before:
+        lw = w.lower().replace("’", "'")
+        if lw in NEGATION_WORDS or lw.endswith("n't"):
+            return True
+    return False
+
+
+def _gap_is_space(text, a, b) -> bool:
+    return a <= b and text[a:b].strip(" \t") == "" and "\n" not in text[a:b]
+
+
+def _word_before_number(number: WrittenNumber, text, s):
+    """B-3: a word of DIRECTION_WORDS_BEFORE, then optional fillers, then the
+    number, with nothing but spaces between. Returns (word, direction, start) or None."""
+    words = _words(text[s:number.start], s)
+    k = len(words) - 1
+    if k < 0 or not _gap_is_space(text, words[k][2], number.start):
+        return None
+    while k >= 0 and words[k][0].lower() in DIRECTION_FILLERS:
+        if k == 0 or not _gap_is_space(text, words[k - 1][2], words[k][1]):
+            return None
+        k -= 1
+    w, ws, _ = words[k]
+    d = DIRECTION_WORDS_BEFORE.get(w.lower())
+    return (w, d, ws) if d else None
+
+
+def _word_after_number(number: WrittenNumber, text, e):
+    """B-3: the number with its unit, then a word of DIRECTION_WORDS_AFTER directly,
+    not followed (after fillers) by "to" or "from"; or a word of
+    DIRECTION_WORDS_AFTER_WITH_BUDGET followed directly (optionally after "the",
+    "its" or "our") by a budget word (E-8). Returns (word, direction, start) or None."""
+    words = _words(text[number.end:e], number.end)
+    if not words or not _gap_is_space(text, number.end, words[0][1]):
+        return None
+    w, ws, we = words[0]
+    lw = w.lower()
+    rest = words[1:]
+
+    def chained(seq, prev_end):
+        out = []
+        for t in seq:
+            if not _gap_is_space(text, prev_end, t[1]):
+                break
+            out.append(t)
+            prev_end = t[2]
+        return out
+
+    following = chained(rest, we)
+    if lw in DIRECTION_WORDS_AFTER:
+        k = 0
+        while k < len(following) and following[k][0].lower() in DIRECTION_FILLERS:
+            k += 1
+        if k < len(following) and following[k][0].lower() in LEVEL_WORDS:
+            return None
+        return (w, DIRECTION_WORDS_AFTER[lw], ws)
+    if lw in DIRECTION_WORDS_AFTER_WITH_BUDGET:
+        k = 0
+        if k < len(following) and following[k][0].lower() in BUDGET_WORD_LEAD_INS:
+            k += 1
+        if k < len(following):
+            tail_start = following[k][1]
+            tail_end = following[k + 1][2] if k + 1 < len(following) else following[k][2]
+            if _starts_with_budget_word(text[tail_start:tail_end]):
+                return (w, DIRECTION_WORDS_AFTER_WITH_BUDGET[lw], ws)
+    return None
+
+
+def _starts_with_budget_word(text) -> bool:
+    raw = [t for t in _TOKEN_RE.findall(text) if t != "&"]
+    if not raw:
+        return False
+    if raw[0].lower() in BUDGET_WORDS:
+        return True
+    return any(tuple(raw[:len(p)]) == p for p in BUDGET_STATUS_WORDS)
+
+
+def _direction_verdict(number: WrittenNumber, text, sentences, line: DataLine):
+    """B-1 to B-6 for a number that matched exactly one line. Returns None when
+    there is nothing to flag, else (reason, direction_word, direction)."""
+    if number.sign is not None:                                   # explicit sign: R3 only (B-1)
+        return None
+    si = _sentence_index(number, sentences)
+    if si is None:
+        return None
+    s, e = sentences[si]
+    attached = []
+    for found in (_word_before_number(number, text, s), _word_after_number(number, text, e)):
+        if found is not None and not _is_negated(text, s, found[2]):
+            attached.append(found)
+    if not attached:
+        return None
+    if len(attached) == 2 and attached[0][1] != attached[1][1]:   # B-6
+        return (REASON_DIRECTION_WORDS_DISAGREE, None, None)    # ruling 3: no single word to carry
+    word, direction = attached[0][0], attached[0][1]
+    want = +1 if direction == UP else -1
+    equal = [f for f in line.figures_of_kind(number.kind) if figure_matches(number, f) and f.sign != 0]
+    if equal and all(f.sign == -want for f in equal):              # B-5, E-6
+        return (REASON_DIRECTION, word, direction)
     return None
 
 
@@ -481,20 +710,27 @@ REASON_AMBIGUOUS = "the line named matches more than one line carrying this figu
 REASON_NAME_DOES_NOT_CARRY_IT = "the line named does not carry this figure"
 REASON_NO_EQUAL_FIGURE = "no close figure equals this number"
 REASON_PICK_MISMATCH = "the picked line does not carry this figure"
+# Addendum 1 B-5, B-6, B-7a.
+REASON_DIRECTION = "the direction word disagrees with the sign printed on the line"
+REASON_DIRECTION_WORDS_DISAGREE = "the two direction words disagree"
 
 
 @dataclass(frozen=True)
 class Acceptance:
     """An acceptance as the store will hold it (WP3-8): who, when, the number as
     written and the line it was matched to or picked (None when the line could
-    not be placed). Keyed by (number, line_id), never by the label 'Flag n'."""
+    not be placed). Keyed by (number, line_id), never by the label 'Flag n'.
+    Addendum 1 B-7: flag_class "direction" adds a third key element."""
     number: str
     line_id: Optional[str]
     name: str
     time: str
+    flag_class: str = FLAG_CLASS_NUMBER
 
     @property
     def key(self):
+        if self.flag_class == FLAG_CLASS_DIRECTION:
+            return (self.number, self.line_id, FLAG_CLASS_DIRECTION)
         return (self.number, self.line_id)
 
 
@@ -516,12 +752,18 @@ class Flag:
     sentence_start: int                   # char span of the sentence, for the marker link
     sentence_end: int
     accepted: Optional[Acceptance]        # the acceptance that covers it, if any
+    # Addendum 1 B-7, B-7a.
+    flag_class: str = FLAG_CLASS_NUMBER   # "number" (Release 1 flags) or "direction"
+    direction_word: Optional[str] = None  # the direction word as written (None for B-6, ruling 3)
+    direction: Optional[str] = None       # "up" / "down" (None for B-6, ruling 3)
 
     @property
     def acceptance_key(self):
         """(number as written, line matched or picked or None): the key an
-        acceptance must carry to cover this flag (WP3-8)."""
-        return (self.number.raw, self.line.line_id if self.line is not None else None)
+        acceptance must carry to cover this flag (WP3-8). A direction flag adds
+        "direction" as a third element (Addendum 1 B-7)."""
+        pair = (self.number.raw, self.line.line_id if self.line is not None else None)
+        return pair + (FLAG_CLASS_DIRECTION,) if self.flag_class == FLAG_CLASS_DIRECTION else pair
 
     @property
     def is_open(self):
@@ -580,6 +822,8 @@ def check_numbers(
 
     for number in find_numbers(narrative_text):
         kind = number.kind
+        # Every line whose figure equals the number: used by picks and listed as
+        # candidates, whatever the pool (Addendum 1 A-5b).
         equal_ids = tuple(
             ln.line_id for ln in block.lines
             if any(figure_matches(number, f) for f in ln.figures_of_kind(kind))
@@ -592,31 +836,48 @@ def check_numbers(
 
         line: Optional[LineRef] = None
         placed = False
+        matched_id: Optional[str] = None
+        status = None
 
         if pick_id is not None:                                         # Option 4: re-run against the picked line
             if pick_id in equal_ids:
-                checked.append(CheckedNumber(number, "matched_by_pick", pick_id, None))
-                continue
-            reason = REASON_PICK_MISMATCH
-            line, placed = block.line_ref(pick_id, kind), True
-        else:
-            name = _nearest_preceding_name(number, narrative_text, sentences, block)
-            name_ids = name[2] if name else ()
-            overlap = [i for i in equal_ids if i in name_ids]
-            if len(overlap) == 1:                                       # Option 2: matched
-                checked.append(CheckedNumber(number, "matched", overlap[0], None))
-                continue
-            if name is None:
-                reason = REASON_NO_NAME
-            elif len(overlap) > 1:
-                reason = REASON_AMBIGUOUS
-            elif equal_ids:
-                reason = REASON_NAME_DOES_NOT_CARRY_IT
+                matched_id, status = pick_id, "matched_by_pick"
             else:
-                reason = REASON_NO_EQUAL_FIGURE
-            # The line is "known" only when the name belongs to exactly one line.
-            if name is not None and len(name_ids) == 1:
-                line, placed = block.line_ref(name_ids[0], kind), True
+                reason = REASON_PICK_MISMATCH
+                line, placed = block.line_ref(pick_id, kind), True
+        else:
+            # Addendum 1 A-3: the automatic match uses one pool only, for the figure and the name.
+            budget_pool = _uses_budget_pool(number, narrative_text, sentences, block)
+            pool_alias = block.budget_alias_lines if budget_pool else block.actual_alias_lines
+            equal_pool = tuple(i for i in equal_ids if block.by_id[i].is_budget == budget_pool)
+            name = _nearest_preceding_name(number, narrative_text, sentences, block, pool_alias)
+            name_ids = name[2] if name else ()
+            overlap = [i for i in equal_pool if i in name_ids]
+            if len(overlap) == 1:                                       # Option 2: matched
+                matched_id, status = overlap[0], "matched"
+            else:
+                if name is None:
+                    reason = REASON_NO_NAME
+                elif len(overlap) > 1:
+                    reason = REASON_AMBIGUOUS
+                elif equal_pool:
+                    reason = REASON_NAME_DOES_NOT_CARRY_IT
+                else:
+                    reason = REASON_NO_EQUAL_FIGURE
+                # The line is "known" only when the name belongs to exactly one line.
+                if name is not None and len(name_ids) == 1:
+                    line, placed = block.line_ref(name_ids[0], kind), True
+
+        flag_class, direction_word, direction = FLAG_CLASS_NUMBER, None, None
+        if matched_id is not None:
+            # Addendum 1 Part B: a matched number (by name or by pick) is direction-checked.
+            verdict = _direction_verdict(number, narrative_text, sentences, block.by_id[matched_id])
+            if verdict is None:
+                checked.append(CheckedNumber(number, status, matched_id, None))
+                continue
+            reason, direction_word, direction = verdict
+            flag_class = FLAG_CLASS_DIRECTION
+            line, placed = block.line_ref(matched_id, kind), True
 
         has_fig = (len(line.figures) > 0) if line is not None else None
         candidates = tuple(block.line_ref(i, kind) for i in equal_ids)
@@ -626,11 +887,14 @@ def check_numbers(
                 block.line_ref(ln.line_id, kind) for ln in block.lines if ln.figures_of_kind(kind)
             )
         key = (number.raw, line.line_id if line is not None else None)
+        if flag_class == FLAG_CLASS_DIRECTION:
+            key = key + (FLAG_CLASS_DIRECTION,)
         flag = Flag(
             ordinal=len(flags) + 1, number=number, kind=kind, kind_words=KIND_WORDS[kind], reason=reason,
             placed=placed, line=line, line_has_figure_of_kind=has_fig, candidate_lines=candidates,
             lines_of_kind=of_kind, picked_line_id=pick_id, sentence_start=s_start, sentence_end=s_end,
-            accepted=accept_by_key.get(key),
+            accepted=accept_by_key.get(key), flag_class=flag_class,
+            direction_word=direction_word, direction=direction,
         )
         flags.append(flag)
         checked.append(CheckedNumber(number, "flagged", line.line_id if line is not None else None, flag))
