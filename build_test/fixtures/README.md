@@ -35,3 +35,14 @@ R.company_rev_per_hc_q, R.bva_q, movement_component_sources=R.MOVEMENT_COMPONENT
 | Used for | The Addendum 1 tests load it under the name `narrative_number_check_release1` and compare its results field by field with the amended module |
 | Never imported by | The product. Not a test file (`unittest discover` does not import it: the `fixtures` folder is not a package) |
 | Suitable for | Builder regression tests only |
+
+## `narrative_number_check_addendum1.py`
+
+| Item | Value |
+|---|---|
+| What it is | A byte-exact copy of `narrative_number_check.py` as it is on `main` at `43f9695` (Release 1 plus D22 Addendum 1) |
+| SHA-256 | `c0a4150daf67be7a6fd454f51c3a8f5e30fe95cfa889433b1d3f48533438572b` (checked by `build_test/test_addendum2_number_check.py`) |
+| Added for | D22 Addendum 2, acceptance criterion "Release 1 behaviour is unchanged for names and numbers not touched by A or D1" |
+| Used for | The Addendum 2 tests load it under the name `narrative_number_check_addendum1` and compare its results field by field with the amended module |
+| Never imported by | The product. Not a test file (`unittest discover` does not import it: the `fixtures` folder is not a package) |
+| Suitable for | Builder regression tests only |
