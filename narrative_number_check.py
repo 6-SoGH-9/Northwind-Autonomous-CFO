@@ -70,6 +70,20 @@ revision 5, signed 2026-11-13; Principal rulings of 2026-11-15 noted with "rulin
           "direction" and their own acceptance key (B-7, B-7a). Ruling 3: a B-6 flag
           carries no direction_word and no direction (both None). R3 still applies to
           numbers with an explicit sign and to numbers with no direction word.
+
+ADDENDUM 2 (governance/builder_briefs/D22_Narrative_versioning_builder_brief_addendum_2.md,
+revision 2, signed 2026-11-13):
+  Part A  Collapse duplicates. When the nearest name belongs to two or more lines
+          (in the pool) whose figures equal the number, the number matches if those
+          equal figures form one distinct printed value (same kind, magnitude and
+          sign, E-A1/E-A2); it is reported against the first of those lines in
+          block order (A-3). Otherwise REASON_AMBIGUOUS, as before.
+  Part D1 Leading qualifiers. A label that begins with one of IGNORABLE_QUALIFIERS
+          also gets the alias without it, when at least MIN_TOKENS_AFTER_QUALIFIER
+          name tokens remain (D1-1 to D1-3). The full label stays an alias.
+  Addendum 1 after collapse (N-4): the direction check runs on a number matched by
+  collapse, against the first collapsed line (all collapsed lines carry the same
+  value), and a direction acceptance key carries that line.
 """
 
 import hashlib
@@ -135,6 +149,24 @@ LEVEL_WORDS = frozenset({"to", "from"})
 # B-4: negations within three words before the direction word (E-4); "n't" forms are matched by suffix.
 NEGATION_WORDS = frozenset({"not", "no", "never", "without"})
 NEGATION_WINDOW = 3
+
+# ---------------------------------------------------------------------------
+# Addendum 2 constants (D1-2, D1-3; Gate decisions 3 and 4)
+# ---------------------------------------------------------------------------
+# The fixed list, as name tokens: the tokenizer reads "Company-wide" as "company", "wide".
+IGNORABLE_QUALIFIERS = (("company", "wide"), ("total",))
+MIN_TOKENS_AFTER_QUALIFIER = 2
+
+
+def _without_leading_qualifier(label_tokens):
+    """D1-1, E-D2: the label's name tokens with ONE leading qualifier of
+    IGNORABLE_QUALIFIERS removed (whole tokens, at the start only), when at least
+    MIN_TOKENS_AFTER_QUALIFIER tokens remain; else None."""
+    for q in IGNORABLE_QUALIFIERS:
+        if tuple(label_tokens[:len(q)]) == q:
+            rest = tuple(label_tokens[len(q):])
+            return rest if len(rest) >= MIN_TOKENS_AFTER_QUALIFIER else None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +439,9 @@ def parse_data_block(data_block: str) -> DataBlock:
                 tail = tuple(_name_tokens(label.rsplit(":", 1)[1]))
                 if tail and tail != full:
                     aliases.append(tail)
+            unqualified = _without_leading_qualifier(full)     # Addendum 2 D1-1
+            if unqualified is not None and unqualified not in aliases:
+                aliases.append(unqualified)
         base = hashlib.sha1(f"{section}\n{stripped}".encode("utf-8")).hexdigest()[:10]
         n = seen.get(base, 0)
         seen[base] = n + 1
@@ -677,6 +712,19 @@ def _starts_with_budget_word(text) -> bool:
     return any(tuple(raw[:len(p)]) == p for p in BUDGET_STATUS_WORDS)
 
 
+def _one_distinct_value(number: WrittenNumber, line_ids, block: DataBlock) -> bool:
+    """Addendum 2 A-1, E-A1, E-A2: the figures that equal the number at the
+    precision written, taken over all the given lines, form one distinct printed
+    value (same kind, same magnitude, same sign)."""
+    values = {
+        (f.kind, f.abs_value, f.sign)
+        for i in line_ids
+        for f in block.by_id[i].figures_of_kind(number.kind)
+        if figure_matches(number, f)
+    }
+    return len(values) == 1
+
+
 def _direction_verdict(number: WrittenNumber, text, sentences, line: DataLine):
     """B-1 to B-6 for a number that matched exactly one line. Returns None when
     there is nothing to flag, else (reason, direction_word, direction)."""
@@ -855,6 +903,8 @@ def check_numbers(
             overlap = [i for i in equal_pool if i in name_ids]
             if len(overlap) == 1:                                       # Option 2: matched
                 matched_id, status = overlap[0], "matched"
+            elif len(overlap) > 1 and _one_distinct_value(number, overlap, block):
+                matched_id, status = overlap[0], "matched"              # Addendum 2 A-1, A-3: first in block order
             else:
                 if name is None:
                     reason = REASON_NO_NAME
