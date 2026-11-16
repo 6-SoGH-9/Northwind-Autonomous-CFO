@@ -323,12 +323,30 @@ class TestPartA_Release1Regression(unittest.TestCase):
         for t in self.CORPUS:
             self.assertFalse(N._has_budget_word(t), t)
 
+    # CHANGED BY ADDENDUM 2 A-1. Addendum 1 expectation: every CORPUS sentence gives the Release 1 result on both
+    # blocks. Addendum 2 expectation: the same, except these sentences, whose name belongs to two lines carrying the
+    # same printed value: Release 1 flagged them REASON_AMBIGUOUS, and now they match the first of those lines.
+    COLLAPSED = {
+        "no heading": {"Revenue was $4,016,906.", "Revenue was $4.0M.", "In APAC: $669,939.",
+                       "1. Headline\n2) Revenue Drivers\nRevenue was $4.0M in Q4 2026 (October 26, 2026)."},
+        "none flagged": {"In APAC: $669,939."},
+    }
+
     def test_blocks_without_budget_lines_give_release1_results(self):
         for label, data in (("no heading", NO_HEADING_DATA), ("none flagged", NONE_FLAGGED_DATA)):
             new_b, old_b = N.parse_data_block(data), self.R1.parse_data_block(data)
             for t in self.CORPUS:
                 with self.subTest(block=label, t=t):
-                    self.assertEqual(summary(N.check_numbers(t, new_b)), summary(self.R1.check_numbers(t, old_b)))
+                    new, old = N.check_numbers(t, new_b), self.R1.check_numbers(t, old_b)
+                    if t not in self.COLLAPSED[label]:
+                        self.assertEqual(summary(new), summary(old))
+                        continue
+                    for cn, co in zip(new.numbers, old.numbers):     # differs only by the collapse
+                        if co.status == "flagged" and co.flag.reason == self.R1.REASON_AMBIGUOUS:
+                            self.assertEqual((cn.status, cn.line_id), ("matched", co.flag.candidate_lines[0].line_id))
+                        else:
+                            self.assertEqual(summary(type(new)((cn,), ())), summary(type(old)((co,), ())))
+                    self.assertNotEqual(summary(new), summary(old))
 
     def test_picks_and_acceptances_give_release1_results(self):
         new_b, old_b = N.parse_data_block(NO_HEADING_DATA), self.R1.parse_data_block(NO_HEADING_DATA)
@@ -349,7 +367,10 @@ class TestPartA_Release1Regression(unittest.TestCase):
                                  summary(self.R1.check_numbers(t, old_b, picks=picks, acceptances=old_acc)))
 
     def test_with_budget_lines_only_revenue_and_budget_sentences_change(self):
-        """On the real block, Release 1 results change only where the Budget line is involved."""
+        """On the real block, Release 1 results change only where the Budget line is involved (Addendum 1) or a
+        name belongs to two lines with the same printed value (Addendum 2 A-1).
+        CHANGED BY ADDENDUM 2 A-1: "In APAC: $669,939." added to the expected list (Release 1: REASON_AMBIGUOUS;
+        now matched by collapse). The other seven entries are unchanged from Addendum 1."""
         old_b = self.R1.parse_data_block(DATA)
         changed = [t for t in self.CORPUS
                    if summary(N.check_numbers(t, BLOCK)) != summary(self.R1.check_numbers(t, old_b))]
@@ -357,6 +378,7 @@ class TestPartA_Release1Regression(unittest.TestCase):
             "Revenue was $4,016,906.", "Revenue was $4.0M.", "Revenue was 6.5%.", "Revenue was $4,294,336.",
             "Revenue missed. It was 6.5% short.", "Revenue came in 6.5% short of target.",
             "1. Headline\n2) Revenue Drivers\nRevenue was $4.0M in Q4 2026 (October 26, 2026).",
+            "In APAC: $669,939.",
         ]))
 
 

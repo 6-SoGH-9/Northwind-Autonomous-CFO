@@ -249,15 +249,21 @@ class TestWP3_3_LineLevel(unittest.TestCase):
         self.assertEqual(statuses("Operating Margin was 38.2%."), [("38.2%", "matched")])
         self.assertEqual(statuses("R&D spend was $902,208."), [("$902,208", "matched")])
 
-    def test_two_equal_lines_both_carry_the_name_is_a_flag(self):
-        """$669,939 is APAC's revenue on two lines (revenue table, regional-investment table)."""
+    def test_two_equal_lines_both_carry_the_name_collapse_to_a_match(self):
+        """CHANGED BY ADDENDUM 2 A-1 (renamed from test_two_equal_lines_both_carry_the_name_is_a_flag).
+        $669,939 is APAC's revenue on two lines (revenue table, regional-investment table).
+        Release 1 / Addendum 1 expectation: "In APAC: $669,939." flagged REASON_AMBIGUOUS with 2 candidate lines.
+        Addendum 2 expectation: both lines carry the same printed value, so the number matches (A-1), reported
+        against the first of the two lines in block order (A-3)."""
         r = check("APAC revenue was $669,939.")
         c = r.numbers[0]
-        # the nearest name here is 'revenue' (two Revenue lines); use the unambiguous form too:
+        # the nearest name here is 'revenue' (not APAC), which does not carry $669,939: unchanged, still a flag
         r2 = check("In APAC: $669,939.")
-        self.assertEqual(r2.numbers[0].status, "flagged")
-        self.assertEqual(r2.flags[0].reason, N.REASON_AMBIGUOUS)
-        self.assertEqual(len(r2.flags[0].candidate_lines), 2)
+        apac = [ln.line_id for ln in BLOCK.lines if ln.label == "APAC"
+                and any(f.raw == "$669,939" for f in ln.figures)]
+        self.assertEqual(len(apac), 2)
+        self.assertEqual((r2.numbers[0].status, r2.numbers[0].line_id), ("matched", apac[0]))
+        self.assertEqual(r2.flags, ())
         self.assertIn(c.status, ("flagged",))
 
     def test_the_name_is_found_but_the_number_equals_a_different_lines_figure(self):
@@ -310,18 +316,21 @@ class TestWP3_3_LineLevel(unittest.TestCase):
         ambiguous: 'Revenue' labels the consolidated line and the Budget vs Actual line and both print $4,016,906
         (D22-G (B3), pass-rule clause (e)). Under A-3 a sentence with no budget word is matched against actual lines
         only, so the Budget line is neither a candidate nor a name, and the number matches the consolidated line.
-        Both lines are still listed as equal-figure lines for a pick (A-5b). The Release 1 outcome is kept below for a
-        block whose Budget section is treated as an actual section, to show what changed."""
+        Both lines are still listed as equal-figure lines for a pick (A-5b).
+        CHANGED AGAIN BY ADDENDUM 2 A-1, for the block without Budget lines only. Addendum 1 expectation there: flagged
+        REASON_AMBIGUOUS with 2 candidate lines (the Release 1 outcome). Addendum 2 expectation: both Revenue lines are
+        actual lines and carry the same printed value $4,016,906, so the number collapses to a match against the first
+        in block order, the consolidated line (A-1, A-3). The Release 1 outcome itself is checked against the byte-exact
+        Release 1 copy in build_test/test_addendum1_number_check.py."""
         r = check("Revenue was $4,016,906.")
         self.assertEqual(r.numbers[0].status, "matched")
         self.assertEqual(r.numbers[0].line_id, line_id("Revenue", 0, "Consolidated"))
-        # Release 1 outcome, reproduced on the same block with the Budget heading renamed (no Budget lines):
         no_budget = N.parse_data_block(DATA.replace(N.BUDGET_SECTION_HEADING, "Budget vs Actual (heading renamed)"))
         self.assertEqual(no_budget.budget_lines, ())
         r1 = N.check_numbers("Revenue was $4,016,906.", no_budget)
-        self.assertEqual(r1.numbers[0].status, "flagged")
-        self.assertEqual(r1.flags[0].reason, N.REASON_AMBIGUOUS)
-        self.assertEqual(len(r1.flags[0].candidate_lines), 2)
+        first = [ln.line_id for ln in no_budget.lines if ln.label == "Revenue"][0]
+        self.assertEqual((r1.numbers[0].status, r1.numbers[0].line_id), ("matched", first))
+        self.assertEqual(first, line_id("Revenue", 0, "Consolidated"))
 
 
 class TestWP3_4_EveryNonExactNumberIsAFlag(unittest.TestCase):
