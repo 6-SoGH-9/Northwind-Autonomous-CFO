@@ -233,7 +233,11 @@ _LIST_PREFIX_RE = re.compile(r"[ \t]*(?:(?:[#>*_\-+][ \t]*)|\*\*|__)*\(?")
 
 
 def _is_list_numbering(text, tok):
-    if tok.sign is not None or "$" in tok.raw or not tok.is_plain_integer or len(tok.raw.strip("+-")) > 3:
+    # Addendum 3 (B-1, B-1a): a token that carries a unit is not list numbering. With no sign
+    # and no "$", a plain integer's raw text is its digits plus any unit the scanner read
+    # ("%", " %", K/k/M/B/MM/mm/bn/mn, pp/pt, x), so "not raw.isdigit()" means a unit was read.
+    if tok.sign is not None or "$" in tok.raw or not tok.is_plain_integer or len(tok.raw.strip("+-")) > 3 \
+            or not tok.raw.isdigit():
         return False
     line_start = text.rfind("\n", 0, tok.start) + 1
     if not _LIST_PREFIX_RE.fullmatch(text[line_start:tok.start]):
