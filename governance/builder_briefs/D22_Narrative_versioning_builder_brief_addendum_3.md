@@ -122,3 +122,23 @@ I confirm the following, each with what it rests on:
 **Architect:** Claude (Architect)  **Date:** 2026-11-21
 
 *The Brief is NOT RELEASED until the Principal approves the Gate. The attestation does not substitute for that.*
+
+---
+
+# Architect note, 2026-11-22 (appended; the text above is unchanged)
+
+Added at the Principal's instruction of 2026-11-22 15:47 ("correct the stale draft lines … by a note, not by rewriting it"). It changes no tick, no decision and no word above this line. **Where the note and the text above differ, the ticks, the approval line and this note govern.**
+
+**Status.** This Addendum is **signed**. The Principal's approval line is dated 2026-11-22 (written instruction of 07:16). It is released. The line "DRAFT … NOT SIGNED. NOT RELEASED." in the status header, and the closing line "The Brief is NOT RELEASED until the Principal approves the Gate", describe the draft and are stale.
+
+**Stale lines, and what governs instead:**
+1. Header, "Revision 3 … B-1, B-2 and B-3 are left **unticked** … B-1a and the build base stay blank": stale. B-1, B-1a, B-2, B-3 and the build base are ticked as shown in "Principal decisions at the Gate".
+2. Gate heading "Addendum 3 (revision 2)": this is revision 3.
+3. Gate status line "☑ AWAITING PRINCIPAL DECISION … ☐ READY FOR PRINCIPAL APPROVAL": stale. The Principal has decided and approved.
+4. Gate categories: "B-1, B-2, B-3 (… to be ticked at signing); B-1a (open)" and "Category E … the B-1a extension. Not authorized until ticked": B-1a is ticked "include", so it is authorized.
+5. Italic line "They are left unticked: the Principal ticks them at signing": stale; they are ticked.
+6. Decision 2 "(recommended)" and decision 5 "(not stated in the Principal's message, so left blank)": the Principal ticked B-1a include and build base `52bb5c5`.
+7. Architect attestation: dated 2026-11-21, written before the ticks. It says B-1a is "a separate, unticked decision" and "the build base … blank"; both are now ticked. The two unticked attestation boxes stay unticked as written ("Required Response Format in full: not done"; and the scope-representation box, which the Architect attested for B-1, B-2 and B-3 only).
+8. Canonical base "`main` at `52bb5c5`": ticked as the build base. At signing `main` was `3f965ee`, which differs from `52bb5c5` only by this file. The Builder built and verified on `3f965ee`.
+
+Nothing in the build or its verification is recorded here; that is in the Handbook, Section 5, D22-I (4b).
